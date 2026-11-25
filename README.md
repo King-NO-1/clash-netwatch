@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0b1220,100:0ea5e9&height=220&section=header&text=Clash%20NetWatch&fontSize=64&fontColor=ffffff&fontAlignY=38&desc=Wi-Fi-aware%20proxy%20%26%20TUN%20switch&descAlignY=58&descSize=20&animation=fadeIn" alt="Clash NetWatch" width="100%" />
+<img src="docs/banner.svg" alt="Clash NetWatch - Wi-Fi aware proxy and TUN switch" width="100%" />
 
 **连上手机热点，自动开代理；离开热点，自动关代理。**
 
@@ -363,7 +363,7 @@ NetWatch
 ## 致谢
 
 - [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) 与 [mihomo](https://github.com/MetaCubeX/mihomo)：命名管道控制接口
-- [capsule-render](https://github.com/kyechan99/capsule-render)、[shields.io](https://github.com/badges/shields)：README 视觉
+- [shields.io](https://github.com/badges/shields)：徽章
 - [Best-README-Template](https://github.com/othneildrew/Best-README-Template)、[awesome-readme](https://github.com/matiassingers/awesome-readme)：README 结构与灵感
 - `legacy/` 保留了上一版 Python 实现（3 秒轮询），仅供回滚参考，不参与运行
 
@@ -371,6 +371,3 @@ NetWatch
 
 [MIT](LICENSE)
 
-<div align="center">
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0ea5e9,100:0b1220&height=120&section=footer" alt="" width="100%" />
-</div>

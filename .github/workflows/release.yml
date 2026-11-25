@@ -30,7 +30,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          Copy-Item config.example.json, install-task.ps1, LICENSE, 快速开始.txt dist/
+          Copy-Item config.example.json, install-task.ps1, LICENSE, QUICKSTART.txt dist/
           Compress-Archive -Path dist/* -DestinationPath netwatch-windows-amd64.zip -Force
           $zip = "dist/netwatch-windows-amd64.zip"
           if (-not (Test-Path $zip)) { Compress-Archive -Path dist/* -DestinationPath $zip -Force }

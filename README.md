@@ -13,6 +13,7 @@
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](go.mod)
 [![Binary](https://img.shields.io/badge/binary-2.8%20MB-informational)](https://github.com/King-NO-1/clash-netwatch/releases)
 [![Backend](https://img.shields.io/badge/backend-Clash%20Verge%20Rev-6366f1)](https://github.com/clash-verge-rev/clash-verge-rev)
+[![CI](https://github.com/King-NO-1/clash-netwatch/actions/workflows/ci.yml/badge.svg)](https://github.com/King-NO-1/clash-netwatch/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Last Commit](https://img.shields.io/github/last-commit/King-NO-1/clash-netwatch?color=0ea5e9)](https://github.com/King-NO-1/clash-netwatch/commits)
 
@@ -113,7 +114,9 @@ flowchart LR
   其它                                                  → 非目标网络
 ```
 
-前缀容错是为了覆盖"热点改名带 `-5G` / `Plus` 后缀"，但要求"够像"——否则一个叫 `MyPhone` 的邻居热点就能骗过判定，而自动连接是**真的会把 Wi-Fi 切过去**的。
+前缀容错是为了覆盖「热点改名带 `-5G` / `Plus` 后缀」这类情况，但要求「够像」（短的一方 ≥6 字节且长度差 ≤4）——否则一个叫 `MyPhone` 的邻居热点也能骗过判定，而自动连接是**真的会把 Wi-Fi 切过去**的。收紧后 `myphone` ↔ `myphone-5g` 仍然命中，`MyPhone` 不会。
+
+**禁止代理名单用另一套规则，故意偏保守**：精确相等，或短的一方 ≥6 字节的前缀（不限长度差），且不受 `fuzzy_match` 开关影响。原因是"多禁"只会让代理关掉，方向安全；而 `Home` 这类短名只认精确，避免把 `HomePhone` 也禁掉。名单项写得越长越精准，写短名等于圈一个前缀范围。
 
 ---
 
@@ -147,7 +150,7 @@ ON 路径（事件驱动，日志实录）：
 
 ### 方式一：下载 exe（推荐）
 
-1. 从 [Releases](https://github.com/King-NO-1/clash-netwatch/releases) 下载 `netwatch-windows-amd64.zip`，解压到任意目录（建议放在非系统盘）；
+1. 从 [Releases](https://github.com/King-NO-1/clash-netwatch/releases) 下载 `netwatch-windows-amd64.zip`，解压到任意目录（建议放在非系统盘）；同目录的 `SHA256SUMS.txt` 可用于校验下载完整性；
 2. **双击 `netwatch.exe`**——第一次运行自动进入设置向导；
 3. 向导会扫描你周围的 Wi-Fi，依次回答三个问题：
    - **目标网络**：哪些网络连上时开代理（比如你的手机热点）；
@@ -166,6 +169,7 @@ ON 路径（事件驱动，日志实录）：
 ```powershell
 git clone https://github.com/King-NO-1/clash-netwatch.git
 cd clash-netwatch
+go test ./...             # 跑一遍回归测试
 go build -trimpath -ldflags "-s -w -H=windowsgui" -o netwatch.exe .
 .\netwatch.exe -setup     # 同样的设置向导
 ```
@@ -314,7 +318,7 @@ NetWatch
 | 内核未起 | 只关不开；目标网络下内核消失则清掉残留系统代理，恢复后自动补回 |
 | 外部改动 | 60s 校准同时充当自愈 |
 | 资源清理 | 句柄按时关闭；管道读超时 3s、写超时 9s，响应体上限 8MB |
-| 长期运行 | 日志 512KB 轮转，每轮只创建有界短生命周期 goroutine |
+| 长期运行 | 日志 512KB 轮转；管道读超时卡死时会遗留一个阻塞线程并计数告警（正常应为 0） |
 
 </details>
 
@@ -344,7 +348,8 @@ NetWatch
 
 - [x] 首次运行设置向导：扫描 Wi-Fi，选择目标 / 自动连接 / 禁止代理网络
 - [x] 网络名单全部配置化：多目标、自动连接子集、禁止名单，无硬编码
-- [x] Release 自动构建：tag 即发布，附 netwatch.exe 与全量 zip
+- [x] Release 自动构建：tag 即发布，附 netwatch.exe、全量 zip 与 SHA256SUMS
+- [x] Go 单元测试 + CI：vet、`go test -race`、构建
 - [ ] 代理后端适配层：Clash Verge / mihomo / 系统代理
 - [ ] `config.json` 热重载
 - [ ] 有线 / USB 共享的识别策略

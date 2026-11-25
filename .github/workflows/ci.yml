@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Vet
+        shell: pwsh
+        run: go vet ./...
+
+      - name: Unit tests with race detector
+        shell: pwsh
+        run: go test -race ./...
+
+      - name: Build
+        shell: pwsh
+        run: go build -trimpath -ldflags "-s -w -H=windowsgui" -o dist/netwatch.exe .

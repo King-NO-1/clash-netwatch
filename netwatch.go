@@ -114,15 +114,19 @@ type Config struct {
 	LogMaxBytes       int64    `json:"log_max_bytes"`
 }
 
-var cfg = Config{
-	FuzzyMatch:       true,
-	AutoConnect:      true,
-	AutoConnectSecs:  15,
-	SyncVergeConfig:  true,
-	ShowTray:         true,
-	ReconcileSeconds: 60,
-	LogMaxBytes:      512 * 1024,
+func defaultConfig() Config {
+	return Config{
+		FuzzyMatch:       true,
+		AutoConnect:      true,
+		AutoConnectSecs:  15,
+		SyncVergeConfig:  true,
+		ShowTray:         true,
+		ReconcileSeconds: 60,
+		LogMaxBytes:      512 * 1024,
+	}
 }
+
+var cfg = defaultConfig()
 
 var exeDir string
 
@@ -133,17 +137,12 @@ func configExists() bool {
 	return err == nil
 }
 
-// loadConfig 返回 (文件是否存在, 是否解析成功)。不存在不算错误，交给首次运行向导。
-func loadConfig() (bool, bool) {
-	exeDir, _ = filepath.Abs(filepath.Dir(os.Args[0]))
-	raw, err := os.ReadFile(configPath())
-	if err != nil {
-		return false, false
-	}
-	// 以当前默认值为基底反序列化：配置文件漏写的字段保持默认，不会被 bool 零值 false 覆盖
-	c := cfg
-	if json.Unmarshal(raw, &c) != nil {
-		return true, false
+// parseConfig 以默认值为基底解析配置：漏写字段保持默认，旧版 target_ssid 并入列表。
+// 单独拆出来是为了能写回归测试（不需要文件系统和 exe 路径）。
+func parseConfig(raw []byte) (Config, error) {
+	c := defaultConfig()
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return Config{}, err
 	}
 	if c.TargetSSID != "" {
 		c.TargetSSIDs = append(c.TargetSSIDs, c.TargetSSID)
@@ -163,6 +162,20 @@ func loadConfig() (bool, bool) {
 	}
 	if c.LogMaxBytes <= 0 {
 		c.LogMaxBytes = 512 * 1024
+	}
+	return c, nil
+}
+
+// loadConfig 返回 (文件是否存在, 是否解析成功)。不存在不算错误，交给首次运行向导。
+func loadConfig() (bool, bool) {
+	exeDir, _ = filepath.Abs(filepath.Dir(os.Args[0]))
+	raw, err := os.ReadFile(configPath())
+	if err != nil {
+		return false, false
+	}
+	c, err := parseConfig(raw)
+	if err != nil {
+		return true, false
 	}
 	cfg = c
 	return true, true
@@ -400,11 +413,13 @@ func syncVergeYAML(on bool) {
 	}
 	d := vergeDir()
 	if d == "" {
+		lg.debug("未找到 Clash Verge 目录，跳过 verge.yaml 同步")
 		return
 	}
 	path := filepath.Join(d, "verge.yaml")
 	raw, err := os.ReadFile(path)
 	if err != nil {
+		lg.logf("WARN", "读取 verge.yaml 失败，跳过同步：%v", err)
 		return
 	}
 	val := fmt.Sprintf("%s: %t", "enable_tun_mode", on)
@@ -414,17 +429,23 @@ func syncVergeYAML(on bool) {
 		return
 	}
 	tmp := path + ".netwatch.tmp"
-	if os.WriteFile(tmp, next, 0644) == nil {
-		if os.Rename(tmp, path) == nil {
-			lg.logf("INFO", "已同步 verge.yaml：%t", on)
-		} else {
-			os.Remove(tmp)
-		}
+	if err := os.WriteFile(tmp, next, 0644); err != nil {
+		lg.logf("WARN", "写入 verge.yaml 临时文件失败：%v", err)
+		return
 	}
+	if err := os.Rename(tmp, path); err != nil {
+		lg.logf("WARN", "替换 verge.yaml 失败：%v", err)
+		os.Remove(tmp)
+		return
+	}
+	lg.logf("INFO", "已同步 verge.yaml：%t", on)
 }
 
 // ---------------------------------------------------------------- 内核控制器（命名管道 HTTP）
 var secretCache atomic.Value // string
+
+// abandonedReaders 记录因管道卡死而放弃等待的读线程数量（正常应为 0）。
+var abandonedReaders atomic.Int64
 
 func findCorePipes() []string {
 	pat, _ := syscall.UTF16PtrFromString(`\\.\pipe\verge-mihomo*`)
@@ -524,8 +545,10 @@ func pipeHTTP(pipe, method, path string, body []byte, secret string, timeout tim
 		select {
 		case <-ch:
 		case <-time.After(300 * time.Millisecond):
-			// 读线程仍未退出（句柄关闭没能打断同步 I/O）。不再等，交给进程退出回收。
-			lg.logf("WARN", "管道读线程未在超时后退出，已放弃等待")
+			// 句柄关闭没能打断同步 I/O：这个读线程会一直阻塞到进程退出。
+			// 只在管道卡死时发生；计数并告警，避免"有界 goroutine"的说法悄悄失真。
+			n := abandonedReaders.Add(1)
+			lg.logf("ERROR", "管道读线程未在超时后退出，已放弃等待（累计 %d 个）", n)
 		}
 		return 0, nil, errors.New("pipe timeout")
 	}
@@ -1178,18 +1201,31 @@ func watchNeverProxy() {
 		if !ok || !isNeverProxy(ssid) {
 			continue
 		}
-		on, srv := sysproxyState()
-		if !on {
-			continue
+		changed := false
+		if on, srv := sysproxyState(); on {
+			port := proxyPort()
+			lg.logf("WARN", "看门狗：%q 属永不代理网络但系统代理开着（%s），强制关闭", ssid, srv)
+			if err := setSysproxy(false, port); err != nil {
+				lg.logf("ERROR", "看门狗强制关闭系统代理失败：%v", err)
+			} else {
+				lg.logf("INFO", "看门狗已关闭系统代理（%q，端口 %d）", ssid, port)
+				changed = true
+			}
 		}
-		port := proxyPort()
-		lg.logf("WARN", "看门狗：%q 属永不代理网络但系统代理开着（%s），强制关闭", ssid, srv)
-		if err := setSysproxy(false, port); err != nil {
-			lg.logf("ERROR", "看门狗强制关闭系统代理失败：%v", err)
-			continue
+		// TUN 和系统代理是两条独立的流量通道，第三道防线必须同时管住，
+		// 否则"2 秒兜底"在 TUN 上最多要等 60 秒校准才生效。
+		if tunOn, reachable := coreInfo(); reachable && tunOn {
+			lg.logf("WARN", "看门狗：%q 属永不代理网络但 TUN 开着，强制关闭", ssid)
+			if err := setTun(false); err != nil {
+				lg.logf("ERROR", "看门狗强制关闭 TUN 失败：%v", err)
+			} else {
+				lg.logf("INFO", "看门狗已关闭 TUN（%q）", ssid)
+				changed = true
+			}
 		}
-		syncVergeYAML(false)
-		lg.logf("INFO", "看门狗已关闭系统代理（%q，端口 %d）", ssid, port)
+		if changed {
+			syncVergeYAML(false)
+		}
 	}
 }
 

@@ -161,7 +161,11 @@ const (
 )
 
 // 自动连接状态。maybeAutoConnect 会被 worker、tray 消息循环、命令行分别调用，全部加锁。
+//
+// autoCallMu 串行化"扫描候选 + 发起连接"这段含 I/O 的流程；autoMu 只保护下面的状态字段，
+// 绝不跨 I/O 持有——否则托盘点「立即连接」时，reconcile 在关代理前要先等这把锁。
 var (
+	autoCallMu      sync.Mutex
 	autoMu          sync.Mutex
 	autoNext        time.Time // 验证窗口 / 失败退避的截止时刻
 	autoFailures    int       // 未确认的连接次数，稳定连上目标后清零
@@ -172,6 +176,13 @@ var (
 	autoSeenAt      time.Time // 首次读到目标 SSID 的时刻（稳定观察起点）
 	autoLastReason  string    // 最近一次判定结论，供 -status / -scan 展示
 )
+
+// setAutoReason 是 autoLastReason 唯一的非持锁写入出口。
+func setAutoReason(s string) {
+	autoMu.Lock()
+	autoLastReason = s
+	autoMu.Unlock()
+}
 
 func autoScanInterval() time.Duration {
 	s := cfg.AutoConnectSecs
@@ -440,8 +451,12 @@ func maybeAutoConnect(reason string) bool {
 	return started
 }
 
-// autoConnectLocked 的调用方必须不持有 autoMu；返回值 alert 由外层负责弹通知。
+// autoConnectLocked 的调用方必须不持有 autoMu / autoCallMu；返回值 alert 由外层负责弹通知。
 func autoConnectLocked(reason string) (started bool, alert string) {
+	// 扫描与 WlanConnect 都含 I/O，用 autoCallMu 串行化，且不把 autoMu 带进这段。
+	autoCallMu.Lock()
+	defer autoCallMu.Unlock()
+
 	// 上次发起的连接还在验证窗口内：别重发。窗口到期仍未连上 → 记一次失败并退避。
 	if confirmConnectResult() {
 		return false, ""
@@ -458,22 +473,30 @@ func autoConnectLocked(reason string) (started bool, alert string) {
 	}
 	c, noProfile, err := bestCandidate(true)
 	if err != nil {
-		autoLastReason = "读取候选失败：" + err.Error()
-		lg.debug("自动连接（%s）：%s", reason, autoLastReason)
+		msg := "读取候选失败：" + err.Error()
+		setAutoReason(msg)
+		lg.debug("自动连接（%s）：%s", reason, msg)
 		return false, ""
 	}
 	if c == nil {
+		var msg string
 		if noProfile {
-			autoLastReason = "候选里有目标 SSID，但没有保存的连接配置（需手动连一次）"
+			msg = "候选里有目标 SSID，但没有保存的连接配置（需手动连一次）"
 		} else {
 			// 可能是压根没看见，也可能看见了但不可连/信号低于阈值，措辞不要一口咬定
-			autoLastReason = "候选里没有可连的目标热点（未出现、不可连或信号低于阈值）"
-			if time.Since(autoLastScan) >= autoScanKickGap {
+			msg = "候选里没有可连的目标热点（未出现、不可连或信号低于阈值）"
+			autoMu.Lock()
+			due := time.Since(autoLastScan) >= autoScanKickGap
+			if due {
 				autoLastScan = time.Now()
+			}
+			autoMu.Unlock()
+			if due {
 				wlanKickScan()
 			}
 		}
-		lg.debug("自动连接（%s）：%s", reason, autoLastReason)
+		setAutoReason(msg)
+		lg.debug("自动连接（%s）：%s", reason, msg)
 		return false, ""
 	}
 
@@ -496,10 +519,9 @@ func autoConnectLocked(reason string) (started bool, alert string) {
 		lg.logf("WARN", "自动连接 %q 失败：%v", c.ssid, err)
 		return false, "自动连接热点失败，稍后自动重试"
 	}
-	autoMu.Lock()
-	autoLastReason = fmt.Sprintf("已发起连接：%q（信号 %d%%，profile %q），等待确认", c.ssid, c.quality, c.profile)
-	autoMu.Unlock()
-	lg.logf("INFO", "检测到目标热点，自动连接（%s）：%s", reason, autoLastReason)
+	msg := fmt.Sprintf("已发起连接：%q（信号 %d%%，profile %q），等待确认", c.ssid, c.quality, c.profile)
+	setAutoReason(msg)
+	lg.logf("INFO", "检测到目标热点，自动连接（%s）：%s", reason, msg)
 	// 文案用实际候选 SSID，多目标时不会张冠李戴
 	return true, fmt.Sprintf("检测到 %s，正在自动切换…", c.ssid)
 }
@@ -507,8 +529,11 @@ func autoConnectLocked(reason string) (started bool, alert string) {
 // forceAutoConnect 供托盘菜单 / -connect 手动触发：绕过冷却与暂停，
 // 但依然遵守「没 profile 不连」「已在目标不重复连」两条底线。
 func forceAutoConnect() (string, bool) {
-	autoMu.Lock()
-	defer autoMu.Unlock()
+	// 串行化"扫描 + 连接"，但只在这一段持有 autoCallMu；
+	// 状态字段用 autoMu 单独保护，reconcile 的关代理路径永远不会被这里的 I/O 卡住。
+	autoCallMu.Lock()
+	defer autoCallMu.Unlock()
+
 	if ssid, ok := currentSSID(); ok && matches(ssid) {
 		// 已经在目标网络：对"期望状态"来说这就是成功，退出码不该是失败
 		return "当前已在目标网络，无需切换", true
@@ -524,14 +549,18 @@ func forceAutoConnect() (string, bool) {
 		return "候选列表里没有目标热点（先打开手机热点再试）", false
 	}
 	now := time.Now()
+	autoMu.Lock()
 	autoNext = now.Add(autoVerifyWindow)
 	autoPending = true
 	autoPendingSSID = c.ssid
 	autoAttemptAt = now
+	autoMu.Unlock()
 	if err := wlanConnectTo(c); err != nil {
+		autoMu.Lock()
 		autoPending = false
 		autoFailures++
 		autoNext = time.Now().Add(autoBackoff(autoFailures))
+		autoMu.Unlock()
 		lg.logf("WARN", "手动连接 %q 失败：%v", c.ssid, err)
 		return fmt.Sprintf("连接失败：%v", err), false
 	}

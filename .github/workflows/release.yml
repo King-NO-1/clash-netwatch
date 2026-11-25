@@ -24,13 +24,13 @@ jobs:
         run: |
           go vet ./...
           $ver = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'dev-' + $env:GITHUB_SHA.Substring(0,7) }
-          go build -trimpath -ldflags "-s -w -X main.version=$ver" -o dist/netwatch.exe .
+          go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=$ver" -o dist/netwatch.exe .
           if (-not (Test-Path dist/netwatch.exe)) { exit 1 }
 
       - name: Package
         shell: pwsh
         run: |
-          Copy-Item config.example.json, install-task.ps1, LICENSE dist/
+          Copy-Item config.example.json, install-task.ps1, LICENSE, 快速开始.txt dist/
           Compress-Archive -Path dist/* -DestinationPath netwatch-windows-amd64.zip -Force
           $zip = "dist/netwatch-windows-amd64.zip"
           if (-not (Test-Path $zip)) { Compress-Archive -Path dist/* -DestinationPath $zip -Force }

@@ -319,7 +319,7 @@ func trayCommand(id uint32) {
 		f, _ := syscall.UTF16FromString(exe)
 		args, _ := syscall.UTF16FromString("-setup")
 		pShellExecute.Call(0, uintptr(unsafe.Pointer(&op[0])), uintptr(unsafe.Pointer(&f[0])),
-			uintptr(unsafe.Pointer(&args[0])), 0, 0)
+			uintptr(unsafe.Pointer(&args[0])), 0, 1) // SW_SHOWNORMAL：向导要可见的控制台
 		trayBalloonForce("NetWatch", "设置向导已打开，按提示重新选择网络即可")
 	case idMenuLog:
 		logPath, _ := filepath.Abs(filepath.Join(exeDir, "netwatch.log"))

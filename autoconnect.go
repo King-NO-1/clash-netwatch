@@ -24,10 +24,73 @@ import (
 )
 
 var (
-	pWlanGetAvailList = wlanapi.NewProc("WlanGetAvailableNetworkList")
-	pWlanConnect      = wlanapi.NewProc("WlanConnect")
-	pWlanScan         = wlanapi.NewProc("WlanScan")
+	pWlanGetAvailList   = wlanapi.NewProc("WlanGetAvailableNetworkList")
+	pWlanGetProfileList = wlanapi.NewProc("WlanGetProfileList")
+	pWlanConnect        = wlanapi.NewProc("WlanConnect")
+	pWlanScan           = wlanapi.NewProc("WlanScan")
 )
+
+// WLAN_PROFILE_INFO：256 个 WCHAR 的 profile 名 + 4 字节 flags = 516 字节。
+type wlanProfileInfo struct {
+	ProfileName [256]uint16
+	Flags       uint32
+}
+
+type wlanProfileInfoList struct {
+	NumberOfItems uint32
+	Index         uint32
+	ProfileInfo   [1]wlanProfileInfo
+}
+
+var (
+	_ [516 - unsafe.Sizeof(wlanProfileInfo{})]struct{}
+	_ [8 - unsafe.Offsetof(wlanProfileInfoList{}.ProfileInfo)]struct{}
+)
+
+// savedProfiles 枚举 Windows 已保存的无线 profile。用 WLAN API 而不是 netsh：
+// netsh 输出走 OEM 代码页，中文 SSID 会乱码；而且 spawn 进程要 140ms+。
+func savedProfiles() []string {
+	var negotiated uint32
+	var handle syscall.Handle
+	r, _, _ := pWlanOpenHandle.Call(2, 0, uintptr(unsafe.Pointer(&negotiated)), uintptr(unsafe.Pointer(&handle)))
+	if r != 0 {
+		return nil
+	}
+	defer pWlanCloseHandle.Call(uintptr(handle), 0)
+	var ifaces *wlanInterfaceInfoList
+	r, _, _ = pWlanEnumIface.Call(uintptr(handle), 0, uintptr(unsafe.Pointer(&ifaces)))
+	if r != 0 || ifaces == nil {
+		return nil
+	}
+	defer pWlanFreeMemory.Call(uintptr(unsafe.Pointer(ifaces)))
+	seen := map[string]bool{}
+	var out []string
+	stride := unsafe.Sizeof(wlanInterfaceInfo{})
+	base := unsafe.Pointer(&ifaces.InterfaceInfo[0])
+	for i := 0; i < int(ifaces.NumberOfItems); i++ {
+		info := (*wlanInterfaceInfo)(unsafe.Add(base, uintptr(i)*stride))
+		var list *wlanProfileInfoList
+		r, _, _ = pWlanGetProfileList.Call(uintptr(handle),
+			uintptr(unsafe.Pointer(&info.InterfaceGUID)), 0, uintptr(unsafe.Pointer(&list)))
+		if r != 0 || list == nil {
+			continue
+		}
+		n := int(list.NumberOfItems)
+		pstride := unsafe.Sizeof(wlanProfileInfo{})
+		pbase := unsafe.Pointer(&list.ProfileInfo[0])
+		for j := 0; j < n; j++ {
+			pi := (*wlanProfileInfo)(unsafe.Add(pbase, uintptr(j)*pstride))
+			name := syscall.UTF16ToString(pi.ProfileName[:])
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+		pWlanFreeMemory.Call(uintptr(unsafe.Pointer(list)))
+	}
+	return out
+}
 
 // WLAN_AVAILABLE_NETWORK（Win32 布局：512 字节 profile 名 + 36 字节 DOT11_SSID +
 // 20 个 DWORD = 628 字节）。这些结构体必须和 wlanapi.h 二进制兼容，用编译期断言锁死。
@@ -99,15 +162,15 @@ const (
 
 // 自动连接状态。maybeAutoConnect 会被 worker、tray 消息循环、命令行分别调用，全部加锁。
 var (
-	autoMu         sync.Mutex
-	autoNext       time.Time // 验证窗口 / 失败退避的截止时刻
-	autoFailures   int       // 未确认的连接次数，稳定连上目标后清零
-	autoLastScan   time.Time // 上次主动 WlanScan 的时刻
-	autoPending    bool      // 已发起 WlanConnect，等待验证
-	autoAttemptAt  time.Time // 最近一次发起连接的时刻
-	autoPendingSSID string   // 最近一次发起连接的 SSID，失败日志用
-	autoSeenAt     time.Time // 首次读到目标 SSID 的时刻（稳定观察起点）
-	autoLastReason string    // 最近一次判定结论，供 -status / -scan 展示
+	autoMu          sync.Mutex
+	autoNext        time.Time // 验证窗口 / 失败退避的截止时刻
+	autoFailures    int       // 未确认的连接次数，稳定连上目标后清零
+	autoLastScan    time.Time // 上次主动 WlanScan 的时刻
+	autoPending     bool      // 已发起 WlanConnect，等待验证
+	autoAttemptAt   time.Time // 最近一次发起连接的时刻
+	autoPendingSSID string    // 最近一次发起连接的 SSID，失败日志用
+	autoSeenAt      time.Time // 首次读到目标 SSID 的时刻（稳定观察起点）
+	autoLastReason  string    // 最近一次判定结论，供 -status / -scan 展示
 )
 
 func autoScanInterval() time.Duration {

@@ -11,6 +11,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,7 +20,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -36,10 +39,12 @@ const (
 )
 
 type suEnv struct {
-	out  *os.File // 向导自己的 stdout
-	cin  *os.File
-	cinOK bool
-	sel  []string // 候选 SSID（按保存状态与信号排序）
+	out        *os.File // 向导自己的 stdout
+	cin        *os.File
+	br         *bufio.Reader
+	cinOK      bool
+	ownConsole bool     // 双击/托盘启动：我们自己 AllocConsole 出来的窗口
+	sel        []string // 候选 SSID（按保存状态与信号排序）
 }
 
 // runSetup 是 -setup / 首次双击 / 托盘「网络设置」的入口，返回进程退出码。
@@ -72,17 +77,21 @@ func (e *suEnv) ensureConsole() bool {
 			return false
 		}
 		e.out = c
+		e.ownConsole = true
 	}
 	if stdinUsable() {
 		e.cin = os.Stdin
-	} else if e.out != os.Stdout { // 双击形态：从新控制台读输入
+	} else if e.ownConsole {
 		c, err := os.OpenFile("CONIN$", os.O_RDONLY, 0)
 		if err != nil {
 			return false
 		}
 		e.cin = c
 	}
-	e.cinOK = e.cin != nil
+	if e.cin != nil {
+		e.br = bufio.NewReader(e.cin)
+		e.cinOK = true
+	}
 	return true
 }
 
@@ -99,33 +108,31 @@ func stdinUsable() bool {
 	return os.Stdin != nil && os.Stdin.Fd() != 0
 }
 
-func isConsoleHandle(f *os.File) bool {
-	if f == nil {
-		return false
-	}
-	var mode uint32
-	r, _, _ := pGetConsoleMode.Call(uintptr(f.Fd()), uintptr(unsafe.Pointer(&mode)))
-	return r != 0
-}
-
+// printf 统一走 writeOut：真控制台用 WriteConsoleW（cp936 控制台下中文不乱码），
+// 管道/文件则直接写 UTF-8 字节。
 func (e *suEnv) printf(format string, args ...any) {
-	fmt.Fprintf(e.out, format, args...)
+	writeOut(syscall.Handle(e.out.Fd()), fmt.Sprintf(format, args...))
 }
 
-// ask 问一个问题并读取一行。cinOK=false（非交互）时返回 def。
+// ask 读取一整行（保留 SSID 里的空格，Fscanln 会截断）。非交互时返回默认值。
 func (e *suEnv) ask(prompt, def string) string {
-	if !e.cinOK {
-		e.printf("%s [%s]（非交互模式，取默认）\n", prompt, def)
-		return def
-	}
 	if prompt != "" {
 		e.printf("%s ", prompt)
 	}
-	var line string
-	if _, err := fmt.Fscanln(e.cin, &line); err != nil || line == "" {
+	if !e.cinOK {
+		e.printf("[%s]（非交互，取默认）\n", def)
 		return def
 	}
-	return strings.TrimSpace(line)
+	line, err := e.br.ReadString('\n')
+	line = strings.TrimRight(line, "\r\n")
+	if err != nil && line == "" {
+		return def
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return def
+	}
+	return line
 }
 
 func (e *suEnv) confirm(prompt string, defYes bool) bool {
@@ -160,21 +167,56 @@ func (e *suEnv) runFlow() int {
 	e.scanNetworks()
 
 	e.printf("第一步：目标网络（连上它们时开启系统代理 + TUN）\n\n")
-	targets := e.pickNetworks(nil, true)
+	targets := e.pickNetworks(true)
 	if len(targets) == 0 {
 		e.printf("\n没有选择任何网络，已取消。\n")
 		return 1
 	}
 
-	e.printf("\n第二步：自动连接（候选里出现这些网络时，自动把 Wi-Fi 切过去）\n")
-	e.printf("     说明：这些网络必须已经手动连过至少一次（Windows 才有保存的密码）。\n\n")
-	autos := e.pickNetworks(targets, false)
+	e.printf("\n第二步：自动连接（电脑在别的网络时，候选里出现目标网络就自动切过去）\n")
+	e.printf("     前提：这些网络必须手动连过至少一次（Windows 才有保存的密码）。\n\n")
+	autoOn := e.confirm("启用自动连接？", cfg.AutoConnect)
+	var autos []string
+	if autoOn {
+		autos = e.pickAuto(targets)
+		if len(autos) == 0 {
+			autoOn = false
+			e.printf("（未选择自动连接网络，已关闭自动连接）\n")
+		}
+	}
 
 	e.printf("\n第三步：禁止代理网络（连上它们时必须立刻关闭代理，优先级最高）\n")
 	e.printf("     典型场景：校园网、公司内网等不允许走代理的网络。\n\n")
-	nevers := e.pickNetworks(nil, false)
+	nevers := e.pickNetworks(false)
 
 	fuzzy := e.confirm("\n模糊匹配？（开启时，\"MyPhone\" 与 \"MyPhone-5G\" 视为同一网络）", true)
+
+	// 交叉校验：同一个网络既开代理又禁止代理，禁止优先，直接从目标里剔除并告知
+	var conflicts []string
+	kept := targets[:0]
+	for _, t := range targets {
+		bad := false
+		for _, n := range nevers {
+			if matchOne(t, n) {
+				bad = true
+				conflicts = append(conflicts, t)
+				break
+			}
+		}
+		if !bad {
+			kept = append(kept, t)
+		}
+	}
+	targets = kept
+	if len(conflicts) > 0 {
+		e.printf("\n注意：%s 同时被选为「目标网络」和「禁止代理」，已从目标里移除（禁止优先）。\n",
+			strings.Join(conflicts, ", "))
+	}
+	if len(targets) == 0 {
+		e.printf("目标网络被禁止名单全部覆盖，无法继续。\n")
+		return 1
+	}
+	autos = filterList(autos, targets)
 
 	// 写配置（以默认值为基底，保留用户没改的运行参数）
 	c := cfg
@@ -189,7 +231,7 @@ func (e *suEnv) runFlow() int {
 		c.NeverProxySSIDs = []string{}
 	}
 	c.FuzzyMatch = fuzzy
-	c.AutoConnect = len(autos) > 0
+	c.AutoConnect = autoOn && len(autos) > 0
 	raw, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		fatalDialog("NetWatch 配置失败", "生成 config.json 失败："+err.Error())
@@ -216,31 +258,50 @@ func (e *suEnv) runFlow() int {
 func (e *suEnv) finish() int {
 	if e.confirm("\n注册开机自启与保活（计划任务）？", true) {
 		if err := installTask(); err != nil {
-			e.printf("自启注册失败：%v（可稍后手动运行 install-task.ps1）\n", err)
+			e.printf("自启注册失败：%v（请确认是从完整 zip 解压的，内含 install-task.ps1）\n", err)
 		} else {
 			e.printf("已注册计划任务 ClashNetWatch（登录 / 联网 / 唤醒 / 每分钟心跳）。\n")
 		}
 	}
 
-	// 旧守护进程持有互斥体，新配置对它不可见：关掉再拉起
-	if pid, _, ok := findProcess("netwatch.exe"); ok && pid != uint32(os.Getpid()) {
+	// 旧守护进程持有单实例互斥体，且进程内的配置不会热更新：先停、等它真正退出，
+	// 再拉起新进程。TerminateProcess 返回不代表进程已消失，抢跑会被互斥体挡掉后
+	// 静默退出（用户以为成功，实际还是旧配置甚至没有守护）。
+	stopped := 0
+	for _, pid := range ourProcesses() {
 		if err := terminate(pid); err == nil {
-			e.printf("已停止旧守护进程（pid %d）。\n", pid)
-			if err := startProcess(exeAbs()); err != nil {
-				e.printf("重新启动守护进程失败：%v（重启电脑后计划任务会自动拉起）\n", err)
-			} else {
-				e.printf("守护进程已按新配置重启。\n")
-			}
-		} else {
-			e.printf("旧守护进程无法停止（%v）；它仍用旧配置运行，重启后生效。\n", err)
+			stopped++
 		}
-	} else {
-		// 本进程即将退出，不会和它抢互斥体
-		if err := startProcess(exeAbs()); err != nil {
-			e.printf("启动守护进程失败：%v（重新双击 netwatch.exe 或重启电脑即可）\n", err)
-		} else {
-			e.printf("守护进程已启动（托盘可见 NetWatch 图标）。\n")
+	}
+	if stopped > 0 {
+		e.printf("已停止旧守护进程（%d 个），等待其释放单实例锁…\n", stopped)
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && len(ourProcesses()) > 0 {
+			time.Sleep(150 * time.Millisecond)
 		}
+	}
+	// 拉起新进程并确认存活。互斥体释放可能有几毫秒延迟，所以失败就重试几次，
+	// 而不是像以前一样打一句"已重启"了事。
+	alive := false
+	var startErr error
+	for attempt := 0; attempt < 3 && !alive; attempt++ {
+		if err := startProcessArgs(exeAbs(), "-daemon"); err != nil {
+			startErr = err
+			break
+		}
+		time.Sleep(1500 * time.Millisecond)
+		alive = len(ourProcesses()) > 0
+		if !alive {
+			time.Sleep(700 * time.Millisecond)
+		}
+	}
+	switch {
+	case startErr != nil:
+		e.printf("启动守护进程失败：%v（可重新双击 netwatch.exe）\n", startErr)
+	case !alive:
+		e.printf("守护进程未能保持运行，请查看 netwatch.log；计划任务若已注册会在下次心跳拉起。\n")
+	default:
+		e.printf("守护进程已按新配置启动（托盘可见 NetWatch 图标）。\n")
 	}
 
 	e.printf("\n全部完成。连上目标网络试试，几秒内会有「已开启代理与 TUN」通知。\n")
@@ -249,15 +310,50 @@ func (e *suEnv) finish() int {
 	return 0
 }
 
+// ourProcesses 只认与本 exe 同路径的 netwatch 进程，避免误杀别处同名程序；
+// 同时排除向导自己（它也叫 netwatch.exe，但还没拿互斥体）。
+func ourProcesses() []uint32 {
+	self := uint32(os.Getpid())
+	want := strings.ToLower(exeAbs())
+	snap, _, _ := pSnapshot.Call(th32csSnapProcess, 0)
+	if snap == 0 || snap == ^uintptr(0) {
+		return nil
+	}
+	defer syscall.CloseHandle(syscall.Handle(snap))
+	var pe procEntry
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	r, _, _ := pProc32First.Call(snap, uintptr(unsafe.Pointer(&pe)))
+	var out []uint32
+	for r != 0 {
+		if pe.ProcessID != self {
+			if p := imagePath(pe.ProcessID); p != "" && strings.EqualFold(p, want) {
+				out = append(out, pe.ProcessID)
+			}
+		}
+		r, _, _ = pProc32Next.Call(snap, uintptr(unsafe.Pointer(&pe)))
+	}
+	return out
+}
+
+func filterList(in, allow []string) []string {
+	var out []string
+	for _, s := range in {
+		if containsAny(allow, s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func exeAbs() string {
 	p, _ := filepath.Abs(os.Args[0])
 	return p
 }
 
-// pauseIfInteractive 双击形态下控制台窗口读完就关，用户来不及看结果：等一次回车。
-// 从 shell 启动时 stdin 是控制台，用户看得见输出，不需要暂停。
+// pauseIfInteractive 双击/托盘形态下，控制台窗口是我们自己开的，读完就关用户来不及看：
+// 等一次回车。从终端 -setup 启动时不暂停。
 func (e *suEnv) pauseIfInteractive() {
-	if e.cinOK && !isConsoleHandle(os.Stdin) {
+	if e.ownConsole && e.cinOK {
 		e.ask("\n按回车键关闭窗口…", "")
 	}
 }
@@ -283,7 +379,7 @@ func (e *suEnv) scanNetworks() {
 			seen[it.ssid] = true
 		}
 	}
-	for _, p := range savedProfiles() {
+	for _, p := range cachedProfiles() {
 		if p != "" {
 			seen[p] = true
 		}
@@ -338,8 +434,20 @@ func signalOf(items []scanItem, ssid string) uint32 {
 	return 0
 }
 
+var (
+	profileOnce  sync.Once
+	profileCache []string
+)
+
+// cachedProfiles 只枚举一次：排序比较器里会反复问「有没有 profile」，
+// 每次都走 WLAN API 会让向导卡几秒。
+func cachedProfiles() []string {
+	profileOnce.Do(func() { profileCache = savedProfiles() })
+	return profileCache
+}
+
 func hasSavedProfile(ssid string) bool {
-	for _, p := range savedProfiles() {
+	for _, p := range cachedProfiles() {
 		if p == ssid {
 			return true
 		}
@@ -347,38 +455,14 @@ func hasSavedProfile(ssid string) bool {
 	return false
 }
 
-// savedProfiles 枚举 Windows 已保存的无线 profile（netsh，只在向导里用一次，
-// 不在热路径上，可以接受 spawn 进程的代价）。
-func savedProfiles() []string {
-	out, err := exec.Command("netsh", "wlan", "show", "profiles").Output()
-	if err != nil {
-		return nil
-	}
-	var res []string
-	for _, line := range strings.Split(string(out), "\n") {
-		// 中文系统 "    所有用户配置文件 : MyPhone"，英文 "All User Profile"
-		if i := strings.Index(line, ": "); i >= 0 {
-			name := strings.TrimSpace(line[i+2:])
-			if name != "" && !strings.Contains(line, "接口") && !strings.Contains(line, "Interface") {
-				res = append(res, name)
-			}
-		}
-	}
-	return res
-}
-
-// pickNetworks 选择一组网络。base 非空时以 base 为默认选择（自动连接步骤），
-// 允许选择列表之外的值（手动输入），返回原始输入的 SSID 名。
-func (e *suEnv) pickNetworks(base []string, required bool) []string {
-	defHint := ""
-	if len(base) > 0 {
-		defHint = "，回车 = 全选上面选过的目标网络"
-	}
-	prompt := "输入序号（多个用逗号或空格分隔，如 1,3），或 0 手动输入"
+// pickNetworks 选择一组网络：序号多选，0 进入手动输入（支持带空格的 SSID），
+// 回车结束。required=true 时不允许空选择。
+func (e *suEnv) pickNetworks(required bool) []string {
+	prompt := "输入序号（多个用逗号或空格分隔，如 1,3）；输 0 手动输入网络名"
 	if !required {
-		prompt += "，回车跳过"
+		prompt += "；回车跳过"
 	}
-	e.printf("%s%s：\n", prompt, defHint)
+	e.printf("%s：\n", prompt)
 
 	chosen := map[string]bool{}
 	for {
@@ -387,18 +471,15 @@ func (e *suEnv) pickNetworks(base []string, required bool) []string {
 			if len(chosen) > 0 {
 				return chosenList(chosen)
 			}
-			if len(base) > 0 {
-				return append([]string(nil), base...) // 有默认取默认
-			}
 			if required {
 				e.printf("这一步至少选择一个网络。\n")
 				continue
 			}
-			return nil // 可选步骤：回车跳过
+			return nil
 		}
 		if line == inputMagic {
-			name := e.ask("  输入网络名（SSID，区分大小写不必担心，会自动模糊匹配）：", "")
-			if name == "" {
+			name := e.ask("  输入网络名（SSID，可以带空格）：", "")
+			if name == "" || name == inputMagic {
 				continue
 			}
 			chosen[name] = true
@@ -409,33 +490,62 @@ func (e *suEnv) pickNetworks(base []string, required bool) []string {
 		for _, tok := range splitTokens(line) {
 			n, err := strconv.Atoi(tok)
 			if err != nil || n < 1 || n > len(e.sel) {
-				e.printf("  序号 %q 不在列表里，请重输。\n", tok)
+				e.printf("  序号 %q 不在列表里；要手动输入名字请先输 0。\n", tok)
 				ok = false
 				break
 			}
 			chosen[e.sel[n-1]] = true
 			e.printf("  已加入 %q\n", e.sel[n-1])
 		}
-		if ok {
-			out := make([]string, 0, len(chosen))
-			for _, b := range base { // base 里的先来，保序
-				if chosen[b] {
-					out = append(out, b)
-				}
+		if ok && len(chosen) > 0 {
+			return chosenList(chosen)
+		}
+	}
+}
+
+// pickAuto 只允许在目标网络里挑自动连接子集，避免出现"自动连一个并不开代理的网络"。
+func (e *suEnv) pickAuto(targets []string) []string {
+	if len(targets) == 0 {
+		return nil
+	}
+	e.printf("候选里出现这些目标网络时，自动把 Wi-Fi 切过去：\n")
+	for i, t := range targets {
+		note := ""
+		if !hasSavedProfile(t) {
+			note = "  [未保存，需先手动连一次]"
+		}
+		e.printf("  %2d. %s%s\n", i+1, t, note)
+	}
+	e.printf("输入序号（可多选），回车 = 全部；输 0 = 不自动连接\n")
+	for {
+		line := e.ask("> ", "")
+		if line == "" {
+			return append([]string(nil), targets...)
+		}
+		if line == inputMagic {
+			return nil
+		}
+		chosen := map[string]bool{}
+		ok := true
+		for _, tok := range splitTokens(line) {
+			n, err := strconv.Atoi(tok)
+			if err != nil || n < 1 || n > len(targets) {
+				e.printf("  序号 %q 不在目标网络里，请重输。\n", tok)
+				ok = false
+				break
 			}
-			for _, s := range e.sel { // 再加列表里手选的
-				if chosen[s] && !containsAny(out, s) {
-					out = append(out, s)
-				}
+			chosen[targets[n-1]] = true
+		}
+		if !ok {
+			continue
+		}
+		var out []string
+		for _, t := range targets {
+			if chosen[t] {
+				out = append(out, t)
 			}
-			for _, k := range chosenList(chosen) { // 最后加手动输入的
-				if !containsAny(out, k) {
-					out = append(out, k)
-				}
-			}
-			if len(out) == 0 {
-				continue
-			}
+		}
+		if len(out) > 0 {
 			return out
 		}
 	}

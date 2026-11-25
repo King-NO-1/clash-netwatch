@@ -833,7 +833,7 @@ func autoConnectTarget(ssid string) bool {
 // 覆盖 "Campus-WiFi"、"Campus-WiFi 5G"、"Campus-WiFi-Guest" 这类变体。
 // 名单完全来自配置，由首次运行向导或用户手工填写。
 func isNeverProxy(ssid string) bool {
-	if ssid == "" {
+	if ssid == "" || len(cfg.NeverProxySSIDs) == 0 {
 		return false
 	}
 	n := norm(ssid)
@@ -841,7 +841,20 @@ func isNeverProxy(ssid string) bool {
 		return false
 	}
 	for _, b := range cfg.NeverProxySSIDs {
-		if nb := norm(b); nb != "" && strings.HasPrefix(n, nb) {
+		nb := norm(b)
+		if nb == "" {
+			continue
+		}
+		if n == nb {
+			return true
+		}
+		// 前缀覆盖 "Campus-WiFi" → "Campus-WiFi-Guest" 这类变体；
+		// 名单项太短（<6 字节）时只认严格相等，避免 "Home" 把 "HomePhone" 也禁掉。
+		short, long := nb, n
+		if len(short) > len(long) {
+			short, long = long, short
+		}
+		if len(short) >= 6 && strings.HasPrefix(long, short) {
 			return true
 		}
 	}
@@ -1281,8 +1294,14 @@ func terminate(pid uint32) error {
 	return nil
 }
 
-func startProcess(exe string) error {
-	cmd, err := syscall.UTF16FromString(`"` + exe + `"`)
+func startProcess(exe string) error { return startProcessArgs(exe, "") }
+
+func startProcessArgs(exe, args string) error {
+	line := `"` + exe + `"`
+	if args != "" {
+		line += " " + args
+	}
+	cmd, err := syscall.UTF16FromString(line)
 	if err != nil {
 		return err
 	}
@@ -1526,6 +1545,9 @@ func runDaemon() int {
 	node, _ := os.Hostname()
 	lg.logf("INFO", "启动 pid=%d host=%s 目标=%q fuzzy=%t 校准=%ds",
 		os.Getpid(), node, targetDisplay(), cfg.FuzzyMatch, cfg.ReconcileSeconds)
+	if len(cfg.NeverProxySSIDs) == 0 {
+		lg.logf("WARN", "禁止代理名单为空：在校园网/公司网下没有强制关闭防线，建议运行 -setup 添加")
+	}
 
 	err1 := watchNetworkProfile()
 	go watchAddrChanges()
@@ -1649,9 +1671,15 @@ func main() {
 		os.Exit(2)
 	}
 	if !parsed {
+		if *daemon {
+			return // 计划任务/心跳：配置坏了就安静退出，弹窗只会每次登录骚扰用户
+		}
 		fatalConfig("config.json 解析失败", "请检查 JSON 格式，或运行 netwatch.exe -setup 重新生成配置。")
 	}
 	if len(cfg.TargetSSIDs) == 0 {
+		if *daemon {
+			return
+		}
 		fatalConfig("未配置目标网络", "请运行 netwatch.exe -setup 选择哪些网络需要开启代理。")
 	}
 

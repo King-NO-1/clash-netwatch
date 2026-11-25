@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?logo=windows&logoColor=white)](https://github.com/King-NO-1/clash-netwatch)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](go.mod)
-[![Binary](https://img.shields.io/badge/binary-2.9%20MB-informational)](https://github.com/King-NO-1/clash-netwatch/releases)
+[![Binary](https://img.shields.io/badge/binary-2.8%20MB-informational)](https://github.com/King-NO-1/clash-netwatch/releases)
 [![Backend](https://img.shields.io/badge/backend-Clash%20Verge%20Rev-6366f1)](https://github.com/clash-verge-rev/clash-verge-rev)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Last Commit](https://img.shields.io/github/last-commit/King-NO-1/clash-netwatch?color=0ea5e9)](https://github.com/King-NO-1/clash-netwatch/commits)
@@ -66,7 +66,7 @@ NetWatch 把这件事做成一个**事件驱动的收敛器**：网络一变就�
 | 多网络支持 | 目标 / 自动连接 / 禁止名单全可配 | 三张名单互相独立，全部用户自定义 |
 | 零第三方依赖 | 纯 Go 标准库 + Win32 | `go.mod` 里没有任何 `require` |
 | 免管理员 | 全程用户态 | 读 SSID、写 `HKCU`、走内核管道都不提权 |
-| 轻量 | 单文件 2.9 MB，常驻 9–15 MB | `-trimpath -ldflags "-s -w"` 构建 |
+| 轻量 | 单文件 2.8 MB，常驻 9–15 MB | `-trimpath -ldflags "-s -w"` 构建 |
 | 自愈 | 被强杀 ≤1 分钟拉回 | 每分钟心跳 + 60 秒定时校准 + 外部改动自动纠偏 |
 
 ---
@@ -157,6 +157,8 @@ ON 路径（事件驱动，日志实录）：
 
 连上目标网络，几秒内收到「已开启代理与 TUN」通知，就配置成功了。
 
+> 压缩包里附了 `快速开始.txt`，包含 SmartScreen 提示、卸载步骤等常见问题。解压后**不要单独移动 exe**：`config.json` 与它同目录，一起移动才不丢配置。
+
 > **自动连接的前提**：这些网络必须手动连过至少一次（Windows 只会使用保存过的密码，不会凭 SSID 猜）。向导的候选列表会标注 `[未保存，自动连接前需手动连一次]`。
 
 ### 方式二：源码编译
@@ -189,6 +191,16 @@ TUN      : true
 ```
 
 这些值直接读内核 API 和注册表，跟任何界面无关，是最权威的状态。托盘右键菜单也可以「网络设置（重新运行向导）」。
+
+### 卸载
+
+```powershell
+# 1. 托盘右键 → 退出；或结束进程
+Stop-Process -Name netwatch -Force -ErrorAction SilentlyContinue
+# 2. 删除计划任务
+schtasks /Delete /TN ClashNetWatch /F
+# 3. 删除程序目录（含 config.json 与日志）
+```
 
 ### 60 秒验证
 

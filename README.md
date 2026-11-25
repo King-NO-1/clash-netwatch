@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?logo=windows&logoColor=white)](https://github.com/King-NO-1/clash-netwatch)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](go.mod)
-[![Binary](https://img.shields.io/badge/binary-2.6%20MB-informational)](https://github.com/King-NO-1/clash-netwatch)
+[![Binary](https://img.shields.io/badge/binary-2.9%20MB-informational)](https://github.com/King-NO-1/clash-netwatch/releases)
 [![Backend](https://img.shields.io/badge/backend-Clash%20Verge%20Rev-6366f1)](https://github.com/clash-verge-rev/clash-verge-rev)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Last Commit](https://img.shields.io/github/last-commit/King-NO-1/clash-netwatch?color=0ea5e9)](https://github.com/King-NO-1/clash-netwatch/commits)
@@ -62,9 +62,11 @@ NetWatch 把这件事做成一个**事件驱动的收敛器**：网络一变就�
 | 快速断开 | 离开目标网络 **305–414 ms** 完成 | 代理先关、TUN 后关，全部走内存与内核接口 |
 | 三道防线 | 禁止网络下代理必关 | 判定层统一入口 + 暂停层不暂停"关" + 2 秒独立看门狗 |
 | 自动切回 | 校园网连着也能跳回热点 | `WlanConnect` + 12 秒验证窗口 + 60s→10min 指数退避 |
+| 开箱即用 | 下载 → 双击 → 向导 | 首次运行扫描 Wi-Fi，选三个名单即完成配置 |
+| 多网络支持 | 目标 / 自动连接 / 禁止名单全可配 | 三张名单互相独立，全部用户自定义 |
 | 零第三方依赖 | 纯 Go 标准库 + Win32 | `go.mod` 里没有任何 `require` |
 | 免管理员 | 全程用户态 | 读 SSID、写 `HKCU`、走内核管道都不提权 |
-| 轻量 | 单文件 2.6 MB，常驻 9–15 MB | `-trimpath -ldflags "-s -w"` 构建 |
+| 轻量 | 单文件 2.9 MB，常驻 9–15 MB | `-trimpath -ldflags "-s -w"` 构建 |
 | 自愈 | 被强杀 ≤1 分钟拉回 | 每分钟心跳 + 60 秒定时校准 + 外部改动自动纠偏 |
 
 ---
@@ -141,43 +143,52 @@ ON 路径（事件驱动，日志实录）：
 
 ## 五、快速开始
 
-> 环境：Windows 10/11 + [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) + Go 1.25+
+> 前提只有一条：Windows 10/11 + 已安装 [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev)。
+
+### 方式一：下载 exe（推荐）
+
+1. 从 [Releases](https://github.com/King-NO-1/clash-netwatch/releases) 下载 `netwatch-windows-amd64.zip`，解压到任意目录（建议放在非系统盘）；
+2. **双击 `netwatch.exe`**——第一次运行自动进入设置向导；
+3. 向导会扫描你周围的 Wi-Fi，依次回答三个问题：
+   - **目标网络**：哪些网络连上时开代理（比如你的手机热点）；
+   - **自动连接**：其中哪些网络出现时自动把 Wi-Fi 切过去；
+   - **禁止代理**：哪些网络绝不能有代理（比如校园网、公司内网）；
+4. 确认注册开机自启，回车，结束。
+
+连上目标网络，几秒内收到「已开启代理与 TUN」通知，就配置成功了。
+
+> **自动连接的前提**：这些网络必须手动连过至少一次（Windows 只会使用保存过的密码，不会凭 SSID 猜）。向导的候选列表会标注 `[未保存，自动连接前需手动连一次]`。
+
+### 方式二：源码编译
 
 ```powershell
-# 1. 拉代码
 git clone https://github.com/King-NO-1/clash-netwatch.git
 cd clash-netwatch
-
-# 2. 写配置：把 target_ssid 改成你的热点名，never_proxy_ssids 填绝不能走代理的网络
-cp config.example.json config.json
-
-# 3. 编译（单文件，无控制台窗口）
 go build -trimpath -ldflags "-s -w -H=windowsgui" -o netwatch.exe .
+.\netwatch.exe -setup     # 同样的设置向导
+```
 
-# 4. 只读体检：确认候选热点、profile、此刻会怎么判
-.\netwatch.exe -scan
+### 随时可用
 
-# 5. 注册开机自启 + 心跳保活
-.\install-task.ps1
-
-# 6. 随时对账
-.\netwatch.exe -status
+```powershell
+.\netwatch.exe -status    # 当前网络、目标、TUN/代理实际状态、是否一致
+.\netwatch.exe -scan      # 只读：列出 WiFi 候选、profile、此刻会怎么判
+.\netwatch.exe -setup     # 重新运行向导，改网络选择
 ```
 
 `-status` 的真实输出长这样：
 
 ```text
 当前网络 : "MyPhone"
-目标     : ON（"MyPhone-5G"）
+目标     : ON（MyPhone-5G）
+禁止代理 : Campus-WiFi
 TUN      : true
 系统代理 : true server=127.0.0.1:7897
 是否一致 : true
 守护进程 : 运行中
 ```
 
-这四项直接读内核 API 和注册表，跟任何界面无关，是最权威的状态。
-
-> **自动连接的前提**：目标热点必须手动连过一次。Windows 的 `WlanConnect` 必须带已保存的 profile，不会凭 SSID 猜密码。没连过时 `-scan` 会明确提示"需手动连一次"。
+这些值直接读内核 API 和注册表，跟任何界面无关，是最权威的状态。托盘右键菜单也可以「网络设置（重新运行向导）」。
 
 ### 60 秒验证
 
@@ -190,21 +201,24 @@ TUN      : true
 
 ## 六、配置
 
-`config.json` 与 exe 同目录，改完重启进程生效：
+`config.json` 与 exe 同目录，由设置向导自动生成；手工修改时改完重启进程（或托盘 → 退出再启动）：
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `target_ssid` | `"MyPhone-5G"` | 目标热点名，唯一 |
-| `fuzzy_match` | `true` | 前缀容错；`false` 为严格相等 |
-| `auto_connect` | `true` | 候选里出现目标热点时自动切过去 |
+| `target_ssids` | 向导选择 | **目标网络**：连上它们时开代理 + TUN，支持多个 |
+| `auto_connect_ssids` | 向导选择 | **自动连接**：候选里出现这些网络时自动切过去；为空则所有目标网络都自动连 |
+| `never_proxy_ssids` | 向导选择 | **禁止代理**：连上时立刻强制关闭代理，优先级最高 |
+| `fuzzy_match` | `true` | 前缀容错（`MyPhone` ↔ `MyPhone-5G` 视为同一网络）；`false` 为严格相等 |
+| `auto_connect` | `true` | 自动连接总开关（选了自动连接网络即开启） |
 | `auto_connect_seconds` | `15` | 候选轮询间隔，最小 5 |
 | `auto_connect_min_signal` | `0` | 只连信号 ≥ 该值的候选（0–100，0 不限） |
 | `proxy_port` | `0` | 0 = 读 `verge.yaml` 的 `verge_mixed_port` |
 | `sync_verge_config` | `true` | 回写 `verge.yaml`，防止 Verge 重启翻旧值 |
 | `show_tray` | `true` | 是否显示托盘图标（关掉可再省约 6 MB 内存） |
 | `reconcile_seconds` | `60` | 定时校准周期，最小 10 |
-| `never_proxy_ssids` | `["Campus-WiFi"]` | 永不代理的追加项；内置项删不掉 |
 | `log_max_bytes` | `524288` | 日志轮转阈值 |
+
+> 旧版单目标字段 `target_ssid` 仍可读取：加载时自动并入 `target_ssids`。
 
 ---
 
@@ -212,15 +226,17 @@ TUN      : true
 
 | 命令 | 作用 |
 |---|---|
-| `netwatch.exe` | 常驻守护（托盘/单实例互斥） |
+| `netwatch.exe` | 无配置时直接进入设置向导；已配置则常驻守护（托盘/单实例互斥） |
+| `netwatch.exe -setup` | 设置向导：扫描 Wi-Fi，选择目标 / 自动连接 / 禁止代理网络 |
 | `netwatch.exe -status` | 当前 SSID、目标、内核、代理/TUN 实际状态、一致性、进程存活 |
 | `netwatch.exe -scan` | 只读：列出候选热点、profile、此刻自动连接会怎么做 |
 | `netwatch.exe -connect` | 立即尝试连目标热点，绕过冷却（退出码可供脚本判断） |
 | `netwatch.exe -once` | 立即校准一次（要求常驻实例没在跑） |
 | `netwatch.exe -refresh` | 重启 Verge GUI，让它重新读盘刷新界面 |
 | `netwatch.exe -refresh -soft` | 只同步配置与内核状态，不重启 GUI |
+| `netwatch.exe -version` | 打印版本号 |
 
-**托盘菜单**：刷新 Clash Verge 界面 / 立即连接目标热点 / 打开日志 / 暂停自动切换 30 分钟 / 退出。
+**托盘菜单**：刷新 Clash Verge 界面 / 立即连接目标热点 / 网络设置（重新运行向导） / 打开日志 / 暂停自动切换 30 分钟 / 退出。
 
 **通知只在状态真的变了时弹**，内容在动作完成后生成，不会虚报：
 
@@ -255,13 +271,13 @@ NetWatch
 |---|---|---|
 | 机制模型 | 通用 | "网络身份 → 期望状态"的收敛器，可迁到任何条件触发任务 |
 | 事件层 | 通用 | NetworkProfile + `NotifyAddrChange` 双备份，纯 Win32 |
-| 决策层 | 半通用 | 单一目标 SSID + 二元开关，规则写死在语义里 |
+| 决策层 | 通用 | 目标 / 自动连接 / 禁止代理三张网络名单全部配置化（设置向导生成） |
 | 执行层 | 强耦合 | Clash Verge 命名管道、`verge.yaml` 字段、Windows 注册表 |
-| 安全策略 | 耦合 | `Campus-WiFi` 硬编码在源码，配置只能追加不能删 |
+| 安全策略 | 通用 | 禁止名单完全由用户定义，无硬编码网络名 |
 
-**结论：** 内核思路通用，实现是"为一个真实痛点定制的专用工具"。它的价值不在"什么都能接"，而在"这一类场景做到 500 ms 级、免管理员、杀了能自己活过来"。
+**结论：** 决策与安全策略已完全配置化——别人下载 exe、双击、在向导里选三个名单就能用。执行层仍然专用（只对接 Clash Verge Rev），这是 500 ms 级延迟的来源，属于有意取舍。
 
-如果要做成通用工具，最小改动是三件事：把规则表配置化（`ssid_pattern → actions`）、抽一个代理后端接口（Verge / mihomo / 系统代理）、把硬编码网络名降级为默认模板。
+如果将来要支持更多代理客户端，方向是抽一个后端接口（Verge / mihomo / 系统代理可插拔）。
 
 ---
 
@@ -314,10 +330,11 @@ NetWatch
 
 ## 十一、路线图
 
-- [ ] 规则表配置化：`ssid_pattern → actions`，支持多目标、多策略
-- [ ] 把硬编码网络名降级为默认模板，交给配置
+- [x] 首次运行设置向导：扫描 Wi-Fi，选择目标 / 自动连接 / 禁止代理网络
+- [x] 网络名单全部配置化：多目标、自动连接子集、禁止名单，无硬编码
+- [x] Release 自动构建：tag 即发布，附 netwatch.exe 与全量 zip
 - [ ] 代理后端适配层：Clash Verge / mihomo / 系统代理
-- [ ] `config.json` 热重载与托盘编辑
+- [ ] `config.json` 热重载
 - [ ] 有线 / USB 共享的识别策略
 - [ ] 事件时间线导出，方便排查"当时到底发生了什么"
 

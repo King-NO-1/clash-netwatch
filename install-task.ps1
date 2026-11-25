@@ -20,7 +20,7 @@ $exe  = Join-Path $dir 'netwatch.exe'
 $name = 'ClashNetWatch'
 if (-not (Test-Path $exe)) { throw "找不到 $exe，请先编译" }
 
-$action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $dir
+$action = New-ScheduledTaskAction -Execute $exe -Argument '-daemon' -WorkingDirectory $dir
 
 $logon = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 $logon.Delay = 'PT15S'

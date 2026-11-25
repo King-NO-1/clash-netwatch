@@ -96,7 +96,13 @@ var (
 // ---------------------------------------------------------------- 配置
 
 type Config struct {
-	TargetSSID        string   `json:"target_ssid"`
+	// TargetSSIDs 是"连上就开代理"的网络。空列表表示尚未配置，守护进程会拒绝启动。
+	TargetSSIDs []string `json:"target_ssids"`
+	// TargetSSID 是旧版单目标字段，加载时并入 TargetSSIDs，写出时不再产生。
+	TargetSSID string `json:"target_ssid,omitempty"`
+	// AutoConnectSSIDs 为空表示"所有目标网络都自动连"；非空时只自动连其中列出的。
+	AutoConnectSSIDs  []string `json:"auto_connect_ssids"`
+	NeverProxySSIDs   []string `json:"never_proxy_ssids"`
 	FuzzyMatch        bool     `json:"fuzzy_match"`
 	AutoConnect       bool     `json:"auto_connect"`            // 候选里出现目标热点时自动切换过去
 	AutoConnectSecs   int      `json:"auto_connect_seconds"`    // 候选轮询间隔
@@ -106,11 +112,9 @@ type Config struct {
 	ShowTray          bool     `json:"show_tray"`
 	ReconcileSeconds  int      `json:"reconcile_seconds"`
 	LogMaxBytes       int64    `json:"log_max_bytes"`
-	NeverProxySSIDs   []string `json:"never_proxy_ssids"` // 永不代理的网络名（硬编码 Campus-WiFi 保底，配置只能加不能减）
 }
 
 var cfg = Config{
-	TargetSSID:       "MyPhone-5G",
 	FuzzyMatch:       true,
 	AutoConnect:      true,
 	AutoConnectSecs:  15,
@@ -118,30 +122,36 @@ var cfg = Config{
 	ShowTray:         true,
 	ReconcileSeconds: 60,
 	LogMaxBytes:      512 * 1024,
-	NeverProxySSIDs:  []string{"Campus-WiFi"},
 }
-
-// builtinNeverProxy 是硬编码保底，不随配置改变——"永远不让 Campus-WiFi 连代理"
-// 这条约束不能被改配置、误判 fuzzy 或暂停绕过。配置里的 never_proxy_ssids 只能追加。
-var builtinNeverProxy = []string{"Campus-WiFi"}
 
 var exeDir string
 
-func loadConfig() {
+func configPath() string { return filepath.Join(exeDir, "config.json") }
+
+func configExists() bool {
+	_, err := os.Stat(configPath())
+	return err == nil
+}
+
+// loadConfig 返回 (文件是否存在, 是否解析成功)。不存在不算错误，交给首次运行向导。
+func loadConfig() (bool, bool) {
 	exeDir, _ = filepath.Abs(filepath.Dir(os.Args[0]))
-	path := filepath.Join(exeDir, "config.json")
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(configPath())
 	if err != nil {
-		return
+		return false, false
 	}
-	// 以当前默认值为基底反序列化：配置文件漏写的字段保持默认，不会被 bool 零值false 覆盖
+	// 以当前默认值为基底反序列化：配置文件漏写的字段保持默认，不会被 bool 零值 false 覆盖
 	c := cfg
 	if json.Unmarshal(raw, &c) != nil {
-		return
+		return true, false
 	}
-	if c.TargetSSID == "" {
-		c.TargetSSID = cfg.TargetSSID
+	if c.TargetSSID != "" {
+		c.TargetSSIDs = append(c.TargetSSIDs, c.TargetSSID)
+		c.TargetSSID = ""
 	}
+	c.TargetSSIDs = cleanSSIDList(c.TargetSSIDs)
+	c.AutoConnectSSIDs = cleanSSIDList(c.AutoConnectSSIDs)
+	c.NeverProxySSIDs = cleanSSIDList(c.NeverProxySSIDs)
 	if c.ReconcileSeconds < 10 {
 		c.ReconcileSeconds = 60
 	}
@@ -155,6 +165,33 @@ func loadConfig() {
 		c.LogMaxBytes = 512 * 1024
 	}
 	cfg = c
+	return true, true
+}
+
+// cleanSSIDList 去掉空白项与归一化后重复的项，保留用户填写的原始大小写。
+func cleanSSIDList(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		k := norm(s)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func targetDisplay() string {
+	if len(cfg.TargetSSIDs) == 0 {
+		return "未配置"
+	}
+	return strings.Join(cfg.TargetSSIDs, ", ")
 }
 
 // ---------------------------------------------------------------- 日志
@@ -739,12 +776,9 @@ func norm(s string) string {
 	return strings.ToLower(normReplacer.Replace(s))
 }
 
-func matches(ssid string) bool {
-	if ssid == "" {
-		return false
-	}
-	a, b := norm(ssid), norm(cfg.TargetSSID)
-	if b == "" {
+func matchOne(ssid, target string) bool {
+	a, b := norm(ssid), norm(target)
+	if a == "" || b == "" {
 		return false
 	}
 	if a == b {
@@ -766,9 +800,38 @@ func matches(ssid string) bool {
 	return strings.HasPrefix(long, short)
 }
 
+func matchList(ssid string, list []string) bool {
+	for _, t := range list {
+		if matchOne(ssid, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// matches 判断当前网络是否属于"开代理"的目标网络集合。
+func matches(ssid string) bool {
+	if ssid == "" || len(cfg.TargetSSIDs) == 0 {
+		return false
+	}
+	return matchList(ssid, cfg.TargetSSIDs)
+}
+
+// autoConnectTarget 判断该网络是否允许被自动连接：
+// 必须是目标网络，且（auto_connect_ssids 为空，或它被显式列在其中）。
+func autoConnectTarget(ssid string) bool {
+	if !matches(ssid) {
+		return false
+	}
+	if len(cfg.AutoConnectSSIDs) == 0 {
+		return true
+	}
+	return matchList(ssid, cfg.AutoConnectSSIDs)
+}
+
 // isNeverProxy 判定当前网络是否属于「永不代理」名单。用归一化后的前缀匹配，
 // 覆盖 "Campus-WiFi"、"Campus-WiFi 5G"、"Campus-WiFi-Guest" 这类变体。
-// 名单 = 硬编码保底 ∪ 配置追加，配置无法删掉内置项。
+// 名单完全来自配置，由首次运行向导或用户手工填写。
 func isNeverProxy(ssid string) bool {
 	if ssid == "" {
 		return false
@@ -776,11 +839,6 @@ func isNeverProxy(ssid string) bool {
 	n := norm(ssid)
 	if n == "" {
 		return false
-	}
-	for _, b := range builtinNeverProxy {
-		if nb := norm(b); nb != "" && strings.HasPrefix(n, nb) {
-			return true
-		}
 	}
 	for _, b := range cfg.NeverProxySSIDs {
 		if nb := norm(b); nb != "" && strings.HasPrefix(n, nb) {
@@ -1467,7 +1525,7 @@ func runDaemon() int {
 	resetNotifyState() // 启动后第一次 apply 不弹通知，避免心跳复活刷屏
 	node, _ := os.Hostname()
 	lg.logf("INFO", "启动 pid=%d host=%s 目标=%q fuzzy=%t 校准=%ds",
-		os.Getpid(), node, cfg.TargetSSID, cfg.FuzzyMatch, cfg.ReconcileSeconds)
+		os.Getpid(), node, targetDisplay(), cfg.FuzzyMatch, cfg.ReconcileSeconds)
 
 	err1 := watchNetworkProfile()
 	go watchAddrChanges()
@@ -1522,7 +1580,10 @@ func printStatus() {
 	} else {
 		fmt.Fprintf(&b, "当前网络 : <读取失败>\n")
 	}
-	fmt.Fprintf(&b, "目标     : %s（%q）\n", stateName(want), cfg.TargetSSID)
+	fmt.Fprintf(&b, "目标     : %s（%s）\n", stateName(want), targetDisplay())
+	if len(cfg.NeverProxySSIDs) > 0 {
+		fmt.Fprintf(&b, "禁止代理 : %s\n", strings.Join(cfg.NeverProxySSIDs, ", "))
+	}
 	fmt.Fprintf(&b, "内核     : %v %s\n", s.coreOK, version)
 	fmt.Fprintf(&b, "TUN      : %t\n", s.tun)
 	fmt.Fprintf(&b, "系统代理 : %t server=%s（期望 127.0.0.1:%d）\n", s.proxyOn, s.server, s.port)
@@ -1548,6 +1609,9 @@ func printStatus() {
 	emit(b.String())
 }
 
+// version 由发布流水线用 -ldflags "-X main.version=vX.Y.Z" 注入
+var version = "dev"
+
 func main() {
 	// 常驻进程几乎不分配内存，收紧 GC 目标换来更小的常驻占用（实测 15MB -> 9MB）
 	debug.SetGCPercent(30)
@@ -1558,9 +1622,38 @@ func main() {
 	soft := flag.Bool("soft", false, "配合 -refresh：只同步配置，不重启 GUI")
 	scan := flag.Bool("scan", false, "列出 WiFi 候选与自动连接判定（只读，不改任何状态）")
 	connect := flag.Bool("connect", false, "立即尝试连接目标热点（绕过冷却，供手动触发/验证）")
+	setup := flag.Bool("setup", false, "打开设置向导：选择目标网络、自动连接网络与禁止代理网络")
+	daemon := flag.Bool("daemon", false, "守护模式（计划任务使用；没有配置时静默退出）")
+	showVersion := flag.Bool("version", false, "打印版本号后退出")
 	flag.Parse()
 
-	loadConfig()
+	exists, parsed := loadConfig()
+
+	if *showVersion {
+		emit("Clash NetWatch " + version + "\n")
+		return
+	}
+	if *setup {
+		os.Exit(runSetup())
+	}
+
+	// 双击首次运行：没有配置文件就直接进向导，回答几个问题就能用
+	if !exists && !*daemon && !*status && !*scan && !*connect && !*once && !*refresh {
+		os.Exit(runSetup())
+	}
+	if !exists {
+		if *daemon {
+			return // 计划任务/心跳：没有配置就安静退出，绝不弹窗
+		}
+		emit("尚未配置：请先运行 netwatch.exe -setup（或直接双击 netwatch.exe）\n")
+		os.Exit(2)
+	}
+	if !parsed {
+		fatalConfig("config.json 解析失败", "请检查 JSON 格式，或运行 netwatch.exe -setup 重新生成配置。")
+	}
+	if len(cfg.TargetSSIDs) == 0 {
+		fatalConfig("未配置目标网络", "请运行 netwatch.exe -setup 选择哪些网络需要开启代理。")
+	}
 
 	if *refresh {
 		os.Exit(cmdRefresh(*soft))

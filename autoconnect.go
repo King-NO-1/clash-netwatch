@@ -105,6 +105,7 @@ var (
 	autoLastScan   time.Time // 上次主动 WlanScan 的时刻
 	autoPending    bool      // 已发起 WlanConnect，等待验证
 	autoAttemptAt  time.Time // 最近一次发起连接的时刻
+	autoPendingSSID string   // 最近一次发起连接的 SSID，失败日志用
 	autoSeenAt     time.Time // 首次读到目标 SSID 的时刻（稳定观察起点）
 	autoLastReason string    // 最近一次判定结论，供 -status / -scan 展示
 )
@@ -170,7 +171,7 @@ func confirmConnectResult() bool {
 	d := autoBackoff(autoFailures)
 	autoNext = time.Now().Add(d)
 	autoLastReason = fmt.Sprintf("连接未成功，第 %d 次，%s 后重试", autoFailures, d)
-	lg.logf("WARN", "自动连接 %q 未连上，%s 后重试（第 %d 次）", cfg.TargetSSID, d, autoFailures)
+	lg.logf("WARN", "自动连接 %q 未连上，%s 后重试（第 %d 次）", autoPendingSSID, d, autoFailures)
 	return true
 }
 
@@ -184,6 +185,7 @@ type scanItem struct {
 	connectable bool
 	profile     string
 	isTarget    bool
+	isAuto      bool // 目标网络且允许自动连接（auto_connect_ssids 过滤后）
 	usable      bool // 网卡不是 not_ready / disconnecting，可以接受新连接
 }
 
@@ -247,6 +249,7 @@ func scanAll() ([]scanItem, error) {
 				// 会把刚断开的目标网络当成"已连接"而跳过，害得切换要等下一轮扫描。
 				// "已经在目标上就别连"由 maybeAutoConnect 用 currentSSID 判断，更准。
 				isTarget: matches(s),
+				isAuto:   autoConnectTarget(s),
 				usable:   usable,
 			})
 		}
@@ -264,7 +267,8 @@ type autoCandidate struct {
 }
 
 // bestCandidate 返回信号最强的可连目标；noProfile 表示「看见了目标但没有已保存配置」。
-func bestCandidate() (*autoCandidate, bool, error) {
+// autoOnly=true 时只考虑允许自动连接的目标（auto_connect_ssids 过滤之后）。
+func bestCandidate(autoOnly bool) (*autoCandidate, bool, error) {
 	items, err := scanAll()
 	if err != nil {
 		return nil, false, err
@@ -273,7 +277,11 @@ func bestCandidate() (*autoCandidate, bool, error) {
 	noProfile := false
 	minSig := uint32(cfg.AutoConnectMinSig)
 	for _, it := range items {
-		if !it.isTarget || !it.usable || !it.connectable {
+		wanted := it.isTarget
+		if autoOnly {
+			wanted = it.isAuto
+		}
+		if !wanted || !it.usable || !it.connectable {
 			continue
 		}
 		if it.profile == "" {
@@ -385,7 +393,7 @@ func autoConnectLocked(reason string) (started bool, alert string) {
 	if ssid, ok := currentSSID(); ok && matches(ssid) {
 		return false, "" // 已在目标，noteTargetSeen 会负责稳定判定与清退避
 	}
-	c, noProfile, err := bestCandidate()
+	c, noProfile, err := bestCandidate(true)
 	if err != nil {
 		autoLastReason = "读取候选失败：" + err.Error()
 		lg.debug("自动连接（%s）：%s", reason, autoLastReason)
@@ -412,6 +420,7 @@ func autoConnectLocked(reason string) (started bool, alert string) {
 	autoMu.Lock()
 	autoNext = now.Add(autoVerifyWindow)
 	autoPending = true
+	autoPendingSSID = c.ssid
 	autoAttemptAt = now
 	autoMu.Unlock()
 	if err := wlanConnectTo(c); err != nil {
@@ -428,8 +437,8 @@ func autoConnectLocked(reason string) (started bool, alert string) {
 	autoLastReason = fmt.Sprintf("已发起连接：%q（信号 %d%%，profile %q），等待确认", c.ssid, c.quality, c.profile)
 	autoMu.Unlock()
 	lg.logf("INFO", "检测到目标热点，自动连接（%s）：%s", reason, autoLastReason)
-	// 文案跟着 target_ssid 走，别写死"MyPhone"——换个目标网络就成假消息了
-	return true, fmt.Sprintf("检测到 %s，正在自动切换…", cfg.TargetSSID)
+	// 文案用实际候选 SSID，多目标时不会张冠李戴
+	return true, fmt.Sprintf("检测到 %s，正在自动切换…", c.ssid)
 }
 
 // forceAutoConnect 供托盘菜单 / -connect 手动触发：绕过冷却与暂停，
@@ -441,7 +450,7 @@ func forceAutoConnect() (string, bool) {
 		// 已经在目标网络：对"期望状态"来说这就是成功，退出码不该是失败
 		return "当前已在目标网络，无需切换", true
 	}
-	c, noProfile, err := bestCandidate()
+	c, noProfile, err := bestCandidate(false)
 	if err != nil {
 		return "读取 WiFi 候选失败：" + err.Error(), false
 	}
@@ -454,6 +463,7 @@ func forceAutoConnect() (string, bool) {
 	now := time.Now()
 	autoNext = now.Add(autoVerifyWindow)
 	autoPending = true
+	autoPendingSSID = c.ssid
 	autoAttemptAt = now
 	if err := wlanConnectTo(c); err != nil {
 		autoPending = false
@@ -498,7 +508,10 @@ func printScan() {
 	} else {
 		fmt.Fprintf(&b, "当前网络 : <读取失败>\n")
 	}
-	fmt.Fprintf(&b, "目标网络 : %q（模糊匹配 %t）\n", cfg.TargetSSID, cfg.FuzzyMatch)
+	fmt.Fprintf(&b, "目标网络 : %s（模糊匹配 %t）\n", targetDisplay(), cfg.FuzzyMatch)
+	if len(cfg.NeverProxySSIDs) > 0 {
+		fmt.Fprintf(&b, "禁止代理 : %s\n", strings.Join(cfg.NeverProxySSIDs, ", "))
+	}
 	fmt.Fprintf(&b, "自动连接 : %s\n\n", autoConnectStatusLine())
 	items, err := scanAll()
 	if err != nil {
@@ -511,11 +524,17 @@ func printScan() {
 		mark := ""
 		if it.isTarget {
 			mark = "   << 目标"
+			if !it.isAuto {
+				mark += "（不自动连）"
+			}
+		}
+		if isNeverProxy(it.ssid) {
+			mark += "   << 禁止代理"
 		}
 		fmt.Fprintf(&b, "  %-30q  信号 %3d%%  可连 %-5v  profile %q%s\n",
 			it.ssid, it.quality, it.connectable, it.profile, mark)
 	}
-	c, noProfile, err := bestCandidate()
+	c, noProfile, err := bestCandidate(true)
 	fmt.Fprintf(&b, "\n本轮判定 : ")
 	cur, curOK := currentSSID()
 	switch {

@@ -36,6 +36,7 @@ const (
 	idMenuPause   = 1003
 	idMenuQuit    = 1004
 	idMenuConnect = 1005
+	idMenuSetup   = 1006
 
 	wmLButtonUp = 0x0202
 	wmRButtonUp = 0x0205
@@ -282,6 +283,7 @@ func trayMenu(hwnd syscall.Handle) {
 	}
 	add(idMenuRefresh, "刷新 Clash Verge 界面")
 	add(idMenuConnect, "立即连接目标热点")
+	add(idMenuSetup, "网络设置（重新运行向导）")
 	add(idMenuLog, "打开日志")
 	if autoPaused() {
 		add(idMenuPause, "恢复自动切换")
@@ -311,6 +313,14 @@ func trayCommand(id uint32) {
 		msg, _ := forceAutoConnect()
 		lg.logf("INFO", "托盘触发「立即连接目标热点」：%s", msg)
 		trayBalloonForce("NetWatch", msg)
+	case idMenuSetup:
+		exe, _ := filepath.Abs(os.Args[0])
+		op, _ := syscall.UTF16FromString("open")
+		f, _ := syscall.UTF16FromString(exe)
+		args, _ := syscall.UTF16FromString("-setup")
+		pShellExecute.Call(0, uintptr(unsafe.Pointer(&op[0])), uintptr(unsafe.Pointer(&f[0])),
+			uintptr(unsafe.Pointer(&args[0])), 0, 0)
+		trayBalloonForce("NetWatch", "设置向导已打开，按提示重新选择网络即可")
 	case idMenuLog:
 		logPath, _ := filepath.Abs(filepath.Join(exeDir, "netwatch.log"))
 		op, _ := syscall.UTF16FromString("open")
@@ -324,7 +334,7 @@ func trayCommand(id uint32) {
 		} else {
 			pauseFor(30 * time.Minute)
 			lg.logf("INFO", "用户从托盘暂停自动切换 30 分钟")
-			trayBalloonForce("NetWatch", "已暂停 30 分钟，不再自动开代理/连热点；切到 Campus-WiFi 仍会强制关闭")
+			trayBalloonForce("NetWatch", "已暂停 30 分钟，不再自动开代理/连热点；禁止网络下仍会强制关闭")
 		}
 	case idMenuQuit:
 		trayRemove()

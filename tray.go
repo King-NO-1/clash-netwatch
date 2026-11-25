@@ -288,7 +288,7 @@ func trayMenu(hwnd syscall.Handle) {
 	if autoPaused() {
 		add(idMenuPause, "恢复自动切换")
 	} else {
-		add(idMenuPause, "暂停自动切换 30 分钟")
+		add(idMenuPause, fmt.Sprintf("暂停自动切换 %d 分钟", cfg.PauseMinutes))
 	}
 	add(idMenuQuit, "退出 NetWatch")
 
@@ -332,8 +332,8 @@ func trayCommand(id uint32) {
 			lg.logf("INFO", "用户从托盘恢复自动切换")
 			trayBalloonForce("NetWatch", "已恢复自动切换")
 		} else {
-			pauseFor(30 * time.Minute)
-			lg.logf("INFO", "用户从托盘暂停自动切换 30 分钟")
+			pauseFor(time.Duration(cfg.PauseMinutes) * time.Minute)
+			lg.logf("INFO", "用户从托盘暂停自动切换 %d 分钟", cfg.PauseMinutes)
 			trayBalloonForce("NetWatch", "已暂停 30 分钟，不再自动开代理/连热点；禁止网络下仍会强制关闭")
 		}
 	case idMenuQuit:

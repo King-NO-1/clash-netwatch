@@ -138,8 +138,14 @@ func TestParseConfigDefaults(t *testing.T) {
 	if !c.FuzzyMatch || !c.AutoConnect || !c.SyncVergeConfig || !c.ShowTray {
 		t.Fatalf("默认布尔值丢失：%+v", c)
 	}
+	if !c.EnableSystemProxy || !c.EnableTun || !c.Notify {
+		t.Fatalf("默认通道/通知开关丢失：%+v", c)
+	}
 	if c.ReconcileSeconds != 60 || c.AutoConnectSecs != 15 || c.LogMaxBytes != 512*1024 {
 		t.Fatalf("默认数值错误：%+v", c)
+	}
+	if c.PauseMinutes != 30 || c.WatchdogSeconds != 2 {
+		t.Fatalf("默认暂停/巡检值错误：%+v", c)
 	}
 	if len(c.TargetSSIDs) != 0 {
 		t.Fatalf("默认不应有目标网络：%v", c.TargetSSIDs)
@@ -169,6 +175,8 @@ func TestParseConfigDedupeAndClamp(t *testing.T) {
 		"reconcile_seconds": 5,
 		"auto_connect_seconds": 1,
 		"auto_connect_min_signal": 300,
+		"pause_minutes": 5000,
+		"watchdog_seconds": 0,
 		"log_max_bytes": 0
 	}`)
 	c, err := parseConfig(raw)
@@ -180,6 +188,77 @@ func TestParseConfigDedupeAndClamp(t *testing.T) {
 	}
 	if c.ReconcileSeconds != 60 || c.AutoConnectSecs != 15 || c.AutoConnectMinSig != 0 || c.LogMaxBytes != 512*1024 {
 		t.Fatalf("越界值未回落到默认：%+v", c)
+	}
+	if c.PauseMinutes != 30 || c.WatchdogSeconds != 2 {
+		t.Fatalf("暂停/巡检越界未回落：%+v", c)
+	}
+}
+
+func TestDesiredState(t *testing.T) {
+	c := cfgWith([]string{"MyPhone"}, nil)
+	withCfg(t, c)
+	if d := desiredState(false); d.proxy || d.tun {
+		t.Fatalf("非目标网络必须两条通道全关：%+v", d)
+	}
+	if d := desiredState(true); !d.proxy || !d.tun {
+		t.Fatalf("默认配置下目标网络应双开：%+v", d)
+	}
+
+	c.EnableSystemProxy, c.EnableTun = true, false
+	withCfg(t, c)
+	if d := desiredState(true); !d.proxy || d.tun {
+		t.Fatalf("只开系统代理的配置未生效：%+v", d)
+	}
+
+	c.EnableSystemProxy, c.EnableTun = false, true
+	withCfg(t, c)
+	if d := desiredState(true); d.proxy || !d.tun {
+		t.Fatalf("只开 TUN 的配置未生效：%+v", d)
+	}
+}
+
+func TestInSyncHonorsChannels(t *testing.T) {
+	c := cfgWith([]string{"MyPhone"}, nil)
+	c.EnableSystemProxy, c.EnableTun = true, false
+	withCfg(t, c)
+
+	// TUN 被配置关闭时，内核不可达不应影响一致性判断
+	s := snapshot{coreOK: false, tun: false, proxyOn: true, server: "127.0.0.1:7897", port: 7897}
+	if !inSync(s, true) {
+		t.Fatal("只开代理的配置不应因 TUN/内核状态被判为不一致")
+	}
+	s.proxyOn = false
+	if inSync(s, true) {
+		t.Fatal("系统代理没开应判为不一致")
+	}
+	s.proxyOn = true
+	s.tun = true
+	if inSync(s, true) {
+		t.Fatal("配置关闭的 TUN 却开着，应判为不一致")
+	}
+
+	// want=false 时两条通道都必须关，与配置无关
+	withCfg(t, cfgWith([]string{"MyPhone"}, nil))
+	s = snapshot{coreOK: true, tun: true, proxyOn: false, server: "127.0.0.1:7897", port: 7897}
+	if inSync(s, false) {
+		t.Fatal("非目标网络下 TUN 仍开着应判为不一致")
+	}
+}
+
+func TestChannelAction(t *testing.T) {
+	cases := []struct {
+		d    targetState
+		want string
+	}{
+		{targetState{true, true}, "已开启系统代理与 TUN"},
+		{targetState{true, false}, "已开启系统代理"},
+		{targetState{false, true}, "已开启 TUN"},
+		{targetState{}, "目标网络保持直连"},
+	}
+	for _, tc := range cases {
+		if got := channelAction(tc.d); got != tc.want {
+			t.Errorf("channelAction(%+v) = %q, want %q", tc.d, got, tc.want)
+		}
 	}
 }
 

@@ -65,6 +65,7 @@ NetWatch 把这件事做成一个**事件驱动的收敛器**：网络一变就�
 | 自动切回 | 校园网连着也能跳回热点 | `WlanConnect` + 12 秒验证窗口 + 60s→10min 指数退避 |
 | 开箱即用 | 下载 → 双击 → 向导 | 首次运行扫描 Wi-Fi，选三个名单即完成配置 |
 | 多网络支持 | 目标 / 自动连接 / 禁止名单全可配 | 三张名单互相独立，全部用户自定义 |
+| 通道可选 | 系统代理与 TUN 独立开关 | 只开代理或只开 TUN 都能用；关闭时永远两条都断 |
 | 零第三方依赖 | 纯 Go 标准库 + Win32 | `go.mod` 里没有任何 `require` |
 | 免管理员 | 全程用户态 | 读 SSID、写 `HKCU`、走内核管道都不提权 |
 | 轻量 | 单文件 2.8 MB，常驻 9–15 MB | `-trimpath -ldflags "-s -w"` 构建 |
@@ -156,6 +157,7 @@ ON 路径（事件驱动，日志实录）：
    - **目标网络**：哪些网络连上时开代理（比如你的手机热点）；
    - **自动连接**：其中哪些网络出现时自动把 Wi-Fi 切过去；
    - **禁止代理**：哪些网络绝不能有代理（比如校园网、公司内网）；
+   最后可选「高级设置」：只开系统代理或只开 TUN、通知开关、托盘、暂停时长、校准/轮询/巡检间隔、信号阈值。
 4. 确认注册开机自启，回车，结束。
 
 连上目标网络，几秒内收到「已开启代理与 TUN」通知，就配置成功了。
@@ -164,7 +166,15 @@ ON 路径（事件驱动，日志实录）：
 
 > **自动连接的前提**：这些网络必须手动连过至少一次（Windows 只会使用保存过的密码，不会凭 SSID 猜）。向导的候选列表会标注 `[未保存，自动连接前需手动连一次]`。
 
-### 方式二：源码编译
+### 方式二：让 AI 装（一句话）
+
+把下面这句发给 Claude Code / Codex / Qoder 等能操作本机的 AI：
+
+> 帮我在这台 Windows 电脑上安装并配置 Clash NetWatch（https://github.com/King-NO-1/clash-netwatch）：从最新 Release 下载 netwatch-windows-amd64.zip 解压到 D:\Tools\clash-netwatch，运行 `netwatch.exe -scan -json` 列出可用 WiFi，然后问我哪些网络要开代理、哪些要自动连接、哪些绝对不能有代理，按回答写 config.json、注册计划任务并启动，最后用 `-status -json` 验证。我的代理客户端是 Clash Verge Rev。
+
+完整执行清单（含校验、JSON 字段、失败回退）见 [INSTALL_WITH_AI.md](INSTALL_WITH_AI.md)。
+
+### 方式三：源码编译
 
 ```powershell
 git clone https://github.com/King-NO-1/clash-netwatch.git
@@ -180,6 +190,8 @@ go build -trimpath -ldflags "-s -w -H=windowsgui" -o netwatch.exe .
 .\netwatch.exe -status    # 当前网络、目标、TUN/代理实际状态、是否一致
 .\netwatch.exe -scan      # 只读：列出 WiFi 候选、profile、此刻会怎么判
 .\netwatch.exe -setup     # 重新运行向导，改网络选择
+.\netwatch.exe -scan -json      # 同上，输出 JSON（给脚本 / AI 用）
+.\netwatch.exe -status -json    # 同上，输出 JSON
 ```
 
 `-status` 的真实输出长这样：
@@ -230,8 +242,13 @@ schtasks /Delete /TN ClashNetWatch /F
 | `auto_connect_min_signal` | `0` | 只连信号 ≥ 该值的候选（0–100，0 不限） |
 | `proxy_port` | `0` | 0 = 读 `verge.yaml` 的 `verge_mixed_port` |
 | `sync_verge_config` | `true` | 回写 `verge.yaml`，防止 Verge 重启翻旧值 |
+| `enable_system_proxy` | `true` | 目标网络下是否开系统代理（只影响 ON，不影响 OFF） |
+| `enable_tun` | `true` | 目标网络下是否开 TUN；与上一项不能同时为 false |
+| `notify` | `true` | 自动切换时是否弹 Windows 通知 |
 | `show_tray` | `true` | 是否显示托盘图标（关掉可再省约 6 MB 内存） |
+| `pause_minutes` | `30` | 托盘「暂停自动切换」的默认时长（1–1440） |
 | `reconcile_seconds` | `60` | 定时校准周期，最小 10 |
+| `watchdog_seconds` | `2` | 禁止网络下的强制巡检间隔（1–60） |
 | `log_max_bytes` | `524288` | 日志轮转阈值 |
 
 > 旧版单目标字段 `target_ssid` 仍可读取：加载时自动并入 `target_ssids`。
@@ -251,8 +268,10 @@ schtasks /Delete /TN ClashNetWatch /F
 | `netwatch.exe -refresh` | 重启 Verge GUI，让它重新读盘刷新界面 |
 | `netwatch.exe -refresh -soft` | 只同步配置与内核状态，不重启 GUI |
 | `netwatch.exe -version` | 打印版本号 |
+| `netwatch.exe -scan -json` | `-scan` 的机器可读输出（候选、名单、判定），给脚本 / AI 用 |
+| `netwatch.exe -status -json` | `-status` 的机器可读输出 |
 
-**托盘菜单**：刷新 Clash Verge 界面 / 立即连接目标热点 / 网络设置（重新运行向导） / 打开日志 / 暂停自动切换 30 分钟 / 退出。
+**托盘菜单**：刷新 Clash Verge 界面 / 立即连接目标热点 / 网络设置（重新运行向导） / 打开日志 / 暂停自动切换 N 分钟（可配置） / 退出。
 
 **通知只在状态真的变了时弹**，内容在动作完成后生成，不会虚报：
 
@@ -350,6 +369,8 @@ NetWatch
 - [x] 网络名单全部配置化：多目标、自动连接子集、禁止名单，无硬编码
 - [x] Release 自动构建：tag 即发布，附 netwatch.exe、全量 zip 与 SHA256SUMS
 - [x] Go 单元测试 + CI：vet、`go test -race`、构建
+- [x] 高级设置：通道开关、通知、暂停时长、巡检/校准/轮询间隔、信号阈值
+- [x] `-scan -json` / `-status -json` 与 AI 一句话安装流程
 - [ ] 代理后端适配层：Clash Verge / mihomo / 系统代理
 - [ ] `config.json` 热重载
 - [ ] 有线 / USB 共享的识别策略

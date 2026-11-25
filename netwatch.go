@@ -109,20 +109,30 @@ type Config struct {
 	AutoConnectMinSig int      `json:"auto_connect_min_signal"` // 信号质量阈值（0-100，0 不限）
 	ProxyPort         int      `json:"proxy_port"`              // 0 = 读 verge.yaml 的 verge_mixed_port
 	SyncVergeConfig   bool     `json:"sync_verge_config"`
+	EnableSystemProxy bool     `json:"enable_system_proxy"` // 目标网络下是否开系统代理
+	EnableTun         bool     `json:"enable_tun"`          // 目标网络下是否开 TUN
+	Notify            bool     `json:"notify"`              // 自动切换时是否弹 Windows 通知
 	ShowTray          bool     `json:"show_tray"`
+	PauseMinutes      int      `json:"pause_minutes"` // 托盘「暂停」的默认时长
 	ReconcileSeconds  int      `json:"reconcile_seconds"`
+	WatchdogSeconds   int      `json:"watchdog_seconds"` // 禁止网络下的强制巡检间隔
 	LogMaxBytes       int64    `json:"log_max_bytes"`
 }
 
 func defaultConfig() Config {
 	return Config{
-		FuzzyMatch:       true,
-		AutoConnect:      true,
-		AutoConnectSecs:  15,
-		SyncVergeConfig:  true,
-		ShowTray:         true,
-		ReconcileSeconds: 60,
-		LogMaxBytes:      512 * 1024,
+		FuzzyMatch:        true,
+		AutoConnect:       true,
+		AutoConnectSecs:   15,
+		SyncVergeConfig:   true,
+		EnableSystemProxy: true,
+		EnableTun:         true,
+		Notify:            true,
+		ShowTray:          true,
+		PauseMinutes:      30,
+		ReconcileSeconds:  60,
+		WatchdogSeconds:   2,
+		LogMaxBytes:       512 * 1024,
 	}
 }
 
@@ -162,6 +172,12 @@ func parseConfig(raw []byte) (Config, error) {
 	}
 	if c.LogMaxBytes <= 0 {
 		c.LogMaxBytes = 512 * 1024
+	}
+	if c.PauseMinutes < 1 || c.PauseMinutes > 24*60 {
+		c.PauseMinutes = 30
+	}
+	if c.WatchdogSeconds < 1 || c.WatchdogSeconds > 60 {
+		c.WatchdogSeconds = 2
 	}
 	return c, nil
 }
@@ -407,7 +423,7 @@ func proxyPort() int {
 }
 
 // syncVergeYAML 保证 Verge 重启/内核重载后不会把状态翻回去。
-func syncVergeYAML(on bool) {
+func syncVergeYAML(tunOn, proxyOn bool) {
 	if !cfg.SyncVergeConfig {
 		return
 	}
@@ -422,9 +438,8 @@ func syncVergeYAML(on bool) {
 		lg.logf("WARN", "读取 verge.yaml 失败，跳过同步：%v", err)
 		return
 	}
-	val := fmt.Sprintf("%s: %t", "enable_tun_mode", on)
-	next := reTunKey.ReplaceAll(raw, []byte(val))
-	next = reSpKey.ReplaceAll(next, []byte(fmt.Sprintf("%s: %t", "enable_system_proxy", on)))
+	next := reTunKey.ReplaceAll(raw, []byte(fmt.Sprintf("enable_tun_mode: %t", tunOn)))
+	next = reSpKey.ReplaceAll(next, []byte(fmt.Sprintf("enable_system_proxy: %t", proxyOn)))
 	if bytes.Equal(raw, next) {
 		return
 	}
@@ -438,7 +453,7 @@ func syncVergeYAML(on bool) {
 		os.Remove(tmp)
 		return
 	}
-	lg.logf("INFO", "已同步 verge.yaml：%t", on)
+	lg.logf("INFO", "已同步 verge.yaml：tun=%t 代理=%t", tunOn, proxyOn)
 }
 
 // ---------------------------------------------------------------- 内核控制器（命名管道 HTTP）
@@ -900,6 +915,34 @@ type snapshot struct {
 	port    int
 }
 
+// targetState 是一条网络下两条通道各自的目标状态。
+// want=false 时一律为零值：安全规则不允许任何通道在非目标网络保持开启，
+// 与 enable_system_proxy / enable_tun 的配置无关。
+type targetState struct {
+	proxy bool
+	tun   bool
+}
+
+func desiredState(want bool) targetState {
+	if !want {
+		return targetState{}
+	}
+	return targetState{proxy: cfg.EnableSystemProxy, tun: cfg.EnableTun}
+}
+
+func channelAction(d targetState) string {
+	switch {
+	case d.proxy && d.tun:
+		return "已开启系统代理与 TUN"
+	case d.proxy:
+		return "已开启系统代理"
+	case d.tun:
+		return "已开启 TUN"
+	default:
+		return "目标网络保持直连"
+	}
+}
+
 func readSnapshot() snapshot {
 	tun, ok := coreInfo()
 	on, srv := sysproxyState()
@@ -907,10 +950,22 @@ func readSnapshot() snapshot {
 }
 
 func inSync(s snapshot, want bool) bool {
-	if want {
-		return s.coreOK && s.tun && s.proxyOn && s.server == fmt.Sprintf("127.0.0.1:%d", s.port)
+	d := desiredState(want)
+	if d.proxy {
+		if !s.proxyOn || s.server != fmt.Sprintf("127.0.0.1:%d", s.port) {
+			return false
+		}
+	} else if s.proxyOn {
+		return false // 配置关闭的通道不允许保持开启
 	}
-	return !s.tun && !s.proxyOn
+	if d.tun {
+		if !s.coreOK || !s.tun {
+			return false
+		}
+	} else if s.tun {
+		return false
+	}
+	return true
 }
 
 var lastSwitch atomic.Value // string: "on"/"off"
@@ -999,7 +1054,23 @@ func resetNotifyState() {
 	}
 	s := readSnapshot()
 	lastNotifiedSSID = ssid
-	lastNotifiedState = s.tun && s.proxyOn
+	lastNotifiedState = channelOn(s)
+}
+
+// channelOn 只统计配置启用的通道，避免"只开代理"时把 TUN 的关闭误判成未开启，
+// 导致每次后台纠错都弹通知。
+func channelOn(s snapshot) bool {
+	d := desiredState(true)
+	switch {
+	case d.proxy && d.tun:
+		return s.proxyOn && s.tun
+	case d.proxy:
+		return s.proxyOn
+	case d.tun:
+		return s.tun
+	default:
+		return false
+	}
 }
 
 // apply 把运行态推到 want，返回是否成功。evtAt 是本轮触发事件的时刻（纳秒，0 表示非事件触发）。
@@ -1007,13 +1078,13 @@ func apply(want bool, reason string, evtAt int64) bool {
 	start := time.Now()
 	s := readSnapshot()
 	port := s.port
+	d := desiredState(want)
 
-	if want && !s.coreOK {
-		lg.logf("WARN", "内核不可达（%s），暂不开启，等待下次校准", reason)
+	// 只有需要 TUN 时，内核不可达才是前置失败条件；只开系统代理不依赖内核。
+	if d.tun && !s.coreOK {
+		lg.logf("WARN", "内核不可达（%s），暂不开启 TUN，等待下次校准", reason)
 		// Verge 内核重启时 TUN 随内核消失，但系统代理写在注册表里不会跟着清。
-		// 11-24 17:40 就是 tun=false/proxy=true/core=false 的半开态：流量全进
-		// 127.0.0.1 的死端口，用户彻底断网。既然开不了 TUN，就把残留代理也关掉，
-		// 让流量直连；内核恢复后下一轮校准会重新把代理+TUN 一起开起来。
+		// 半开态（core=false / proxy=true）会让流量灌进死端口，先清掉代理让流量直连。
 		if s.proxyOn {
 			if e := setSysproxy(false, port); e != nil {
 				lg.logf("ERROR", "内核不可达时清理残留系统代理失败：%v", e)
@@ -1027,21 +1098,37 @@ func apply(want bool, reason string, evtAt int64) bool {
 	var err error
 	var tTun, tProxy int64
 	if want {
-		// 先开系统代理（快，~200ms 内流量就能走代理），再建 TUN（mihomo 重建 Wintun 需 1s+）
-		t0 := time.Now()
-		err = setSysproxy(true, port)
-		tProxy = time.Since(t0).Milliseconds()
-		if err == nil {
-			t0 = time.Now()
+		// 先开系统代理（快），再建 TUN（mihomo 重建 Wintun 需 1s+）
+		if d.proxy {
+			t0 := time.Now()
+			err = setSysproxy(true, port)
+			tProxy = time.Since(t0).Milliseconds()
+		}
+		if err == nil && d.tun {
+			t0 := time.Now()
 			if e := setTun(true); e != nil {
 				err = e
-				if rbErr := setSysproxy(false, port); rbErr != nil { // 回滚也要确认，否则会留半开状态
-					lg.logf("ERROR", "TUN 开启失败且回滚系统代理失败：%v", rbErr)
+				if d.proxy {
+					if rbErr := setSysproxy(false, port); rbErr != nil { // 回滚也要确认，否则会留半开状态
+						lg.logf("ERROR", "TUN 开启失败且回滚系统代理失败：%v", rbErr)
+					}
 				}
 			}
 			tTun = time.Since(t0).Milliseconds()
 		}
+		// 配置里关掉的通道，如果实际还开着（用户刚改配置），顺手收掉
+		if err == nil && !d.proxy && s.proxyOn {
+			if e := setSysproxy(false, port); e != nil {
+				err = e
+			}
+		}
+		if err == nil && !d.tun && s.tun && s.coreOK {
+			if e := setTun(false); e != nil {
+				err = e
+			}
+		}
 	} else {
+		// 关闭：两条通道都关，安全规则不因配置放宽
 		t0 := time.Now()
 		if e := setSysproxy(false, port); e != nil {
 			err = e
@@ -1057,7 +1144,7 @@ func apply(want bool, reason string, evtAt int64) bool {
 		lg.logf("ERROR", "切换到 %s 失败：%v", stateName(want), err)
 		return false
 	}
-	syncVergeYAML(want)
+	syncVergeYAML(d.tun, d.proxy)
 	lastSwitch.Store(stateName(want))
 
 	total := time.Since(start)
@@ -1067,18 +1154,20 @@ func apply(want bool, reason string, evtAt int64) bool {
 	}
 	// 只回读注册表（微秒级），不再为了一行日志多打一次管道往返
 	proxyOn, _ := sysproxyState()
-	lg.logf("INFO", "切换 %s via %q 完成：代理 %dms + TUN %dms = %dms（%s）；tun=%t proxy=%t",
-		stateName(want), reason, tProxy, tTun, total.Milliseconds(), evt, want, proxyOn)
+	lg.logf("INFO", "切换 %s via %q 完成：代理 %dms + TUN %dms = %dms（%s）；期望 tun=%t proxy=%t；实际 proxy=%t",
+		stateName(want), reason, tProxy, tTun, total.Milliseconds(), evt, d.tun, d.proxy, proxyOn)
 
-	// 界面反馈：只在"网络或运行态相对上次通知真的变了"时弹，后台纠错不弹。
-	if networkChanged(lastSSID, want) {
+	if !cfg.Notify {
+		trayNotify(lastSSID, want, "")
+	} else if networkChanged(lastSSID, want) {
+		// 界面反馈：只在"网络或运行态相对上次通知真的变了"时弹，后台纠错不弹。
 		ssidText := lastSSID
 		if ssidText == "" {
 			ssidText = "未连接网络"
 		}
 		action := "已关闭代理与 TUN"
 		if want {
-			action = "已开启代理与 TUN"
+			action = channelAction(d)
 		}
 		trayNotify(lastSSID, want, fmt.Sprintf("%s · %s · %dms", action, ssidText, total.Milliseconds()))
 	} else {
@@ -1194,7 +1283,7 @@ func watchAddrChanges() {
 // 它只写 HKCU 注册表（微秒级、不经内核管道），因此内核挂掉时同样能清掉代理。
 // TUN 是否随内核消失由内核自身决定；守护进程能关的部分一定关掉。
 func watchNeverProxy() {
-	t := time.NewTicker(2 * time.Second)
+	t := time.NewTicker(time.Duration(cfg.WatchdogSeconds) * time.Second)
 	defer t.Stop()
 	for range t.C {
 		ssid, ok := currentSSID()
@@ -1224,7 +1313,7 @@ func watchNeverProxy() {
 			}
 		}
 		if changed {
-			syncVergeYAML(false)
+			syncVergeYAML(false, false)
 		}
 	}
 }
@@ -1407,14 +1496,16 @@ func cmdRefresh(soft bool) int {
 	want := okSSID && effectiveWant(ssid)
 	before := readSnapshot()
 	daemonRunning := acquireInstance() == instAlreadyRunning
+	d := desiredState(want)
 	p("当前网络 : %q → 目标 %s", ssid, stateName(want))
+	p("期望通道 : 系统代理=%t TUN=%t", d.proxy, d.tun)
 	p("刷新前   : 内核 tun=%t，注册表 代理=%t；verge.yaml %s", before.tun, before.proxyOn, vergeYAMLState())
 
 	// [1/3] 真实状态先对齐目标，避免 Verge 重启后按错误的值初始化
 	if !daemonRunning && !inSync(before, want) {
 		apply(want, "手动刷新", 0)
 	}
-	syncVergeYAML(want)
+	syncVergeYAML(d.tun, d.proxy)
 	p("[1/3] 配置已同步：verge.yaml %s%s", vergeYAMLState(),
 		map[bool]string{true: "（守护进程在跑，状态由它维护）", false: ""}[daemonRunning])
 
@@ -1626,11 +1717,67 @@ func runDaemon() int {
 	}
 }
 
-func printStatus() {
+type statusJSON struct {
+	Version           string   `json:"version"`
+	CurrentSSID       string   `json:"current_ssid"`
+	Target            bool     `json:"target"`
+	TargetSSIDs       []string `json:"target_ssids"`
+	NeverProxySSIDs   []string `json:"never_proxy_ssids"`
+	EnableSystemProxy bool     `json:"enable_system_proxy"`
+	EnableTun         bool     `json:"enable_tun"`
+	CoreReachable     bool     `json:"core_reachable"`
+	CoreVersion       string   `json:"core_version"`
+	Tun               bool     `json:"tun"`
+	SystemProxy       bool     `json:"system_proxy"`
+	ProxyServer       string   `json:"proxy_server"`
+	Consistent        bool     `json:"consistent"`
+	AutoConnect       string   `json:"auto_connect"`
+	Paused            bool     `json:"paused"`
+	Daemon            string   `json:"daemon"`
+	LastSwitch        string   `json:"last_switch,omitempty"`
+}
+
+func printStatus(asJSON bool) {
 	ssid, ok := currentSSID()
 	s := readSnapshot()
 	want := ok && effectiveWant(ssid)
-	version := coreVersion()
+	coreVer := coreVersion()
+
+	daemon := "unknown"
+	switch acquireInstance() {
+	case instAlreadyRunning:
+		daemon = "running"
+	case instAcquired:
+		daemon = "stopped"
+	}
+
+	if asJSON {
+		out := statusJSON{
+			Version:           version,
+			CurrentSSID:       ssid,
+			Target:            want,
+			TargetSSIDs:       nonNil(cfg.TargetSSIDs),
+			NeverProxySSIDs:   nonNil(cfg.NeverProxySSIDs),
+			EnableSystemProxy: cfg.EnableSystemProxy,
+			EnableTun:         cfg.EnableTun,
+			CoreReachable:     s.coreOK,
+			CoreVersion:       coreVer,
+			Tun:               s.tun,
+			SystemProxy:       s.proxyOn,
+			ProxyServer:       s.server,
+			Consistent:        inSync(s, want),
+			AutoConnect:       autoConnectStatusLine(),
+			Paused:            autoPaused(),
+			Daemon:            daemon,
+		}
+		if v, vok := lastSwitch.Load().(string); vok {
+			out.LastSwitch = v
+		}
+		raw, _ := json.MarshalIndent(out, "", "  ")
+		emit(string(raw) + "\n")
+		return
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "时间     : %s\n", time.Now().Format("2006-01-02 15:04:05"))
 	if ok {
@@ -1639,10 +1786,11 @@ func printStatus() {
 		fmt.Fprintf(&b, "当前网络 : <读取失败>\n")
 	}
 	fmt.Fprintf(&b, "目标     : %s（%s）\n", stateName(want), targetDisplay())
+	fmt.Fprintf(&b, "通道     : 系统代理=%t TUN=%t\n", cfg.EnableSystemProxy, cfg.EnableTun)
 	if len(cfg.NeverProxySSIDs) > 0 {
 		fmt.Fprintf(&b, "禁止代理 : %s\n", strings.Join(cfg.NeverProxySSIDs, ", "))
 	}
-	fmt.Fprintf(&b, "内核     : %v %s\n", s.coreOK, version)
+	fmt.Fprintf(&b, "内核     : %v %s\n", s.coreOK, coreVer)
 	fmt.Fprintf(&b, "TUN      : %t\n", s.tun)
 	fmt.Fprintf(&b, "系统代理 : %t server=%s（期望 127.0.0.1:%d）\n", s.proxyOn, s.server, s.port)
 	fmt.Fprintf(&b, "是否一致 : %t\n", inSync(s, want))
@@ -1653,10 +1801,10 @@ func printStatus() {
 	if d := pauseRemain(); d > 0 {
 		fmt.Fprintf(&b, "自动切换 : 已暂停，还剩 %d 分钟（托盘菜单可恢复）\n", int(d.Minutes())+1)
 	}
-	switch acquireInstance() {
-	case instAlreadyRunning:
+	switch daemon {
+	case "running":
 		fmt.Fprintf(&b, "守护进程 : 运行中\n")
-	case instAcquired:
+	case "stopped":
 		fmt.Fprintf(&b, "守护进程 : 未运行（互斥体空闲）\n")
 	default:
 		fmt.Fprintf(&b, "守护进程 : 未知（互斥体创建失败）\n")
@@ -1665,6 +1813,13 @@ func printStatus() {
 		fmt.Fprintf(&b, "本次运行 : 最近切换 %s\n", v)
 	}
 	emit(b.String())
+}
+
+func nonNil(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
 }
 
 // version 由发布流水线用 -ldflags "-X main.version=vX.Y.Z" 注入
@@ -1683,6 +1838,7 @@ func main() {
 	setup := flag.Bool("setup", false, "打开设置向导：选择目标网络、自动连接网络与禁止代理网络")
 	daemon := flag.Bool("daemon", false, "守护模式（计划任务使用；没有配置时静默退出）")
 	showVersion := flag.Bool("version", false, "打印版本号后退出")
+	jsonOut := flag.Bool("json", false, "配合 -scan / -status：输出 JSON，便于脚本或 AI 解析")
 	flag.Parse()
 
 	exists, parsed := loadConfig()
@@ -1718,13 +1874,19 @@ func main() {
 		}
 		fatalConfig("未配置目标网络", "请运行 netwatch.exe -setup 选择哪些网络需要开启代理。")
 	}
+	if !cfg.EnableSystemProxy && !cfg.EnableTun {
+		if *daemon {
+			return
+		}
+		fatalConfig("没有可用的代理通道", "系统代理和 TUN 都被关闭了，请运行 netwatch.exe -setup 至少开启一个。")
+	}
 
 	if *refresh {
 		os.Exit(cmdRefresh(*soft))
 	}
 	if *scan {
 		consoleEcho = true
-		printScan()
+		printScan(*jsonOut)
 		return
 	}
 	if *connect {
@@ -1737,7 +1899,7 @@ func main() {
 		return
 	}
 	if *status {
-		printStatus()
+		printStatus(*jsonOut)
 		return
 	}
 	if *once {

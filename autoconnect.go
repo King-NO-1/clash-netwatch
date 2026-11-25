@@ -15,6 +15,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -591,23 +592,107 @@ func autoConnectStatusLine() string {
 	return s
 }
 
+type scanCandidateJSON struct {
+	SSID        string `json:"ssid"`
+	Signal      uint32 `json:"signal"`
+	Profile     string `json:"profile,omitempty"`
+	Connectable bool   `json:"connectable"`
+	Target      bool   `json:"target"`
+	AutoConnect bool   `json:"auto_connect"`
+	NeverProxy  bool   `json:"never_proxy"`
+}
+
+type scanJSON struct {
+	Version              string              `json:"version"`
+	CurrentSSID          string              `json:"current_ssid"`
+	TargetSSIDs          []string            `json:"target_ssids"`
+	AutoConnectSSIDs     []string            `json:"auto_connect_ssids"`
+	NeverProxySSIDs      []string            `json:"never_proxy_ssids"`
+	FuzzyMatch           bool                `json:"fuzzy_match"`
+	EnableSystemProxy    bool                `json:"enable_system_proxy"`
+	EnableTun            bool                `json:"enable_tun"`
+	AutoConnectEnabled   bool                `json:"auto_connect_enabled"`
+	AutoConnectSeconds   int                 `json:"auto_connect_seconds"`
+	AutoConnectMinSignal int                 `json:"auto_connect_min_signal"`
+	Paused               bool                `json:"paused"`
+	Candidates           []scanCandidateJSON `json:"candidates"`
+	Decision             string              `json:"decision"`
+	DecisionText         string              `json:"decision_text"`
+}
+
 // printScan 是 -scan 的只读诊断：列出全部候选，说明此刻自动连接会怎么做，
 // 不发起任何连接、不改注册表/内核，用于验证 profile 与模糊匹配是否正确。
-func printScan() {
+// asJSON=true 时输出机器可读结构，供脚本 / AI 安装流程解析。
+func printScan(asJSON bool) {
+	cur, curOK := currentSSID()
+	items, scanErr := scanAll()
+	c, noProfile, bestErr := bestCandidate(true)
+
+	decision, decisionText := "", ""
+	switch {
+	case curOK && matches(cur):
+		decision, decisionText = "already_on_target", "已在目标网络，无需连接"
+	case scanErr != nil:
+		decision, decisionText = "scan_failed", "扫描失败："+scanErr.Error()
+	case bestErr != nil:
+		decision, decisionText = "scan_failed", "扫描失败："+bestErr.Error()
+	case c != nil:
+		decision = "will_connect"
+		decisionText = fmt.Sprintf("会发起连接 → %q（profile %q，信号 %d%%）", c.ssid, c.profile, c.quality)
+	case noProfile:
+		decision, decisionText = "target_without_profile", "看见目标但没有 profile，需手动连一次后才能自动切"
+	default:
+		decision, decisionText = "no_target_candidate", "候选里没有可连的目标热点，不动作"
+	}
+
+	if asJSON {
+		out := scanJSON{
+			Version:              version,
+			CurrentSSID:          cur,
+			TargetSSIDs:          nonNil(cfg.TargetSSIDs),
+			AutoConnectSSIDs:     nonNil(cfg.AutoConnectSSIDs),
+			NeverProxySSIDs:      nonNil(cfg.NeverProxySSIDs),
+			FuzzyMatch:           cfg.FuzzyMatch,
+			EnableSystemProxy:    cfg.EnableSystemProxy,
+			EnableTun:            cfg.EnableTun,
+			AutoConnectEnabled:   cfg.AutoConnect,
+			AutoConnectSeconds:   cfg.AutoConnectSecs,
+			AutoConnectMinSignal: cfg.AutoConnectMinSig,
+			Paused:               autoPaused(),
+			Decision:             decision,
+			DecisionText:         decisionText,
+		}
+		out.Candidates = make([]scanCandidateJSON, 0, len(items))
+		for _, it := range items {
+			out.Candidates = append(out.Candidates, scanCandidateJSON{
+				SSID:        it.ssid,
+				Signal:      it.quality,
+				Profile:     it.profile,
+				Connectable: it.connectable,
+				Target:      it.isTarget,
+				AutoConnect: it.isAuto,
+				NeverProxy:  isNeverProxy(it.ssid),
+			})
+		}
+		raw, _ := json.MarshalIndent(out, "", "  ")
+		emit(string(raw) + "\n")
+		return
+	}
+
 	var b strings.Builder
-	if ssid, ok := currentSSID(); ok {
-		fmt.Fprintf(&b, "当前网络 : %q\n", ssid)
+	if curOK {
+		fmt.Fprintf(&b, "当前网络 : %q\n", cur)
 	} else {
 		fmt.Fprintf(&b, "当前网络 : <读取失败>\n")
 	}
 	fmt.Fprintf(&b, "目标网络 : %s（模糊匹配 %t）\n", targetDisplay(), cfg.FuzzyMatch)
+	fmt.Fprintf(&b, "通道     : 系统代理=%t TUN=%t\n", cfg.EnableSystemProxy, cfg.EnableTun)
 	if len(cfg.NeverProxySSIDs) > 0 {
 		fmt.Fprintf(&b, "禁止代理 : %s\n", strings.Join(cfg.NeverProxySSIDs, ", "))
 	}
 	fmt.Fprintf(&b, "自动连接 : %s\n\n", autoConnectStatusLine())
-	items, err := scanAll()
-	if err != nil {
-		fmt.Fprintf(&b, "扫描失败 : %v\n", err)
+	if scanErr != nil {
+		fmt.Fprintf(&b, "扫描失败 : %v\n", scanErr)
 		emit(b.String())
 		return
 	}
@@ -626,21 +711,7 @@ func printScan() {
 		fmt.Fprintf(&b, "  %-30q  信号 %3d%%  可连 %-5v  profile %q%s\n",
 			it.ssid, it.quality, it.connectable, it.profile, mark)
 	}
-	c, noProfile, err := bestCandidate(true)
-	fmt.Fprintf(&b, "\n本轮判定 : ")
-	cur, curOK := currentSSID()
-	switch {
-	case curOK && matches(cur):
-		fmt.Fprintf(&b, "已在目标网络，无需连接\n")
-	case err != nil:
-		fmt.Fprintf(&b, "扫描失败 %v\n", err)
-	case c != nil:
-		fmt.Fprintf(&b, "会发起连接 → %q（profile %q，信号 %d%%）\n", c.ssid, c.profile, c.quality)
-	case noProfile:
-		fmt.Fprintf(&b, "看见目标但没有 profile，需手动连一次后才能自动切\n")
-	default:
-		fmt.Fprintf(&b, "候选里没有可连的目标热点，不动作\n")
-	}
+	fmt.Fprintf(&b, "\n本轮判定 : %s\n", decisionText)
 	if autoPaused() {
 		fmt.Fprintf(&b, "注意     : 自动切换处于暂停状态，守护进程不会发起连接\n")
 	}

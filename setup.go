@@ -146,6 +146,18 @@ func (e *suEnv) confirm(prompt string, defYes bool) bool {
 	return ans == "y" || ans == "yes" || (defYes && ans == "")
 }
 
+// askInt 读取一个指定范围的整数；非法输入重问，非交互模式取默认值。
+func (e *suEnv) askInt(prompt string, def, min, max int) int {
+	for {
+		s := e.ask(fmt.Sprintf("%s（%d–%d）", prompt, min, max), strconv.Itoa(def))
+		n, err := strconv.Atoi(strings.TrimSpace(s))
+		if err == nil && n >= min && n <= max {
+			return n
+		}
+		e.printf("  需要 %d–%d 之间的整数。\n", min, max)
+	}
+}
+
 // fatalDialog 向导是 windowsgui 程序，没有控制台时唯一可靠的报错通道是 MessageBox。
 func fatalDialog(title, text string) {
 	t, _ := syscall.UTF16PtrFromString(title)
@@ -232,6 +244,26 @@ func (e *suEnv) runFlow() int {
 	}
 	c.FuzzyMatch = fuzzy
 	c.AutoConnect = autoOn && len(autos) > 0
+
+	if e.confirm("\n要自定义高级设置吗？（默认：系统代理 + TUN 都开、通知开、暂停 30 分钟）", false) {
+		sp := e.confirm("目标网络下开启系统代理？", c.EnableSystemProxy)
+		tun := e.confirm("目标网络下开启 TUN？", c.EnableTun)
+		for !sp && !tun {
+			e.printf("至少开启一个通道，否则这个工具不会做任何事。\n")
+			sp = e.confirm("目标网络下开启系统代理？", true)
+			tun = e.confirm("目标网络下开启 TUN？", true)
+		}
+		c.EnableSystemProxy = sp
+		c.EnableTun = tun
+		c.Notify = e.confirm("自动切换时弹 Windows 通知？", c.Notify)
+		c.ShowTray = e.confirm("显示托盘图标？", c.ShowTray)
+		c.PauseMinutes = e.askInt("托盘「暂停」默认时长（分钟）", c.PauseMinutes, 1, 1440)
+		c.ReconcileSeconds = e.askInt("定时校准周期（秒）", c.ReconcileSeconds, 10, 3600)
+		c.AutoConnectSecs = e.askInt("热点候选轮询间隔（秒）", c.AutoConnectSecs, 5, 600)
+		c.AutoConnectMinSig = e.askInt("自动连接的最低信号（0–100，0=不限）", c.AutoConnectMinSig, 0, 100)
+		c.WatchdogSeconds = e.askInt("禁止网络巡检间隔（秒）", c.WatchdogSeconds, 1, 60)
+	}
+
 	raw, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		fatalDialog("NetWatch 配置失败", "生成 config.json 失败："+err.Error())
@@ -611,5 +643,9 @@ func (e *suEnv) printSummary() {
 	} else {
 		e.printf("  禁止代理          : （无，建议至少加上校园网/公司网）\n")
 	}
-	e.printf("  模糊匹配          : %t\n", cfg.FuzzyMatch)
+	e.printf("  启用通道          : 系统代理=%t TUN=%t\n", cfg.EnableSystemProxy, cfg.EnableTun)
+	e.printf("  模糊匹配          : %t　通知：%t　托盘：%t\n", cfg.FuzzyMatch, cfg.Notify, cfg.ShowTray)
+	e.printf("  校准/轮询/巡检    : %ds / %ds / %ds　暂停默认 %d 分钟\n",
+		cfg.ReconcileSeconds, cfg.AutoConnectSecs, cfg.WatchdogSeconds, cfg.PauseMinutes)
+	e.printf("  自动连接信号阈值  : %d%%\n", cfg.AutoConnectMinSig)
 }

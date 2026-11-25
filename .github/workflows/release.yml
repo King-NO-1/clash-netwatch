@@ -35,7 +35,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          Copy-Item config.example.json, install-task.ps1, LICENSE, QUICKSTART.txt dist/
+          Copy-Item config.example.json, install-task.ps1, LICENSE, QUICKSTART.txt, INSTALL_WITH_AI.md dist/
           Compress-Archive -Path dist/* -DestinationPath dist/netwatch-windows-amd64.zip -Force
           $lines = foreach ($f in (Get-ChildItem dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' })) {
             "{0}  {1}" -f (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower(), $f.Name

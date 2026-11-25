@@ -1,0 +1,21 @@
+{
+  "on_networks": [
+    "MyPhone",
+    "MyPhonemagic6 pro2"
+  ],
+  "off_networks": [
+    "Campus-WiFi"
+  ],
+  "default_action": "off",
+  "fuzzy_prefix_match": true,
+  "poll_seconds": 2,
+  "confirm_polls": 2,
+  "switch_cooldown_seconds": 8,
+  "drift_check_seconds": 4,
+  "min_reapply_seconds": 2,
+  "core_lost_grace_seconds": 20,
+  "sync_verge_config": true,
+  "proxy_port": null,
+  "core_wait_seconds": 180,
+  "log_max_bytes": 1048576
+}

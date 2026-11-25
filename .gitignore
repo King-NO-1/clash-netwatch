@@ -1,0 +1,15 @@
+# 本地运行产物
+netwatch.exe
+*.exe
+netwatch.log
+netwatch.log.*
+paused.until
+
+# 个人配置（只提交 config.example.json）
+config.json
+
+# 测试与临时文件
+*.bak
+*.tmp
+__pycache__/
+*.pyc

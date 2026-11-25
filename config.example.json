@@ -1,0 +1,13 @@
+{
+  "target_ssid": "MyPhone-5G",
+  "fuzzy_match": true,
+  "auto_connect": true,
+  "auto_connect_seconds": 15,
+  "auto_connect_min_signal": 0,
+  "proxy_port": 0,
+  "sync_verge_config": true,
+  "show_tray": true,
+  "reconcile_seconds": 60,
+  "log_max_bytes": 524288,
+  "never_proxy_ssids": ["Campus-WiFi"]
+}
